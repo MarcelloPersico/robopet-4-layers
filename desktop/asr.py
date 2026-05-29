@@ -12,7 +12,9 @@ be imported (and unit-tested) on a machine without the model or CUDA.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
@@ -22,6 +24,26 @@ import numpy as np
 import protocol
 
 log = logging.getLogger("asr")
+
+
+def _add_cuda_dll_dirs() -> None:
+    """Make ctranslate2 (CUDA-12 build) find cuBLAS/cuDNN on Windows.
+
+    ctranslate2's GPU build links the CUDA 12 runtime (cublas64_12.dll) and
+    cuDNN 9, which we provide via the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12`
+    pip packages rather than a full CUDA toolkit. Their DLL dirs aren't on PATH,
+    so register them before faster_whisper imports ctranslate2. Best-effort and
+    Windows-only (no-op elsewhere / if the packages are absent)."""
+    if not hasattr(os, "add_dll_directory"):
+        return
+    for pkg in ("nvidia.cublas", "nvidia.cudnn"):
+        try:
+            mod = importlib.import_module(pkg)
+            bin_dir = os.path.join(list(mod.__path__)[0], "bin")
+            if os.path.isdir(bin_dir):
+                os.add_dll_directory(bin_dir)
+        except Exception as e:  # noqa: BLE001 - fall back to CPU/system libs
+            log.debug("could not register CUDA dll dir for %s: %s", pkg, e)
 
 PARTIAL_INTERVAL_S = 0.7
 MIN_PARTIAL_SAMPLES = protocol.AUDIO_SAMPLE_RATE // 2  # 0.5 s
@@ -42,6 +64,8 @@ class ASR:
         self.events: asyncio.Queue[_Event] = asyncio.Queue(maxsize=400)
 
     async def load(self) -> None:
+        if self._device.startswith("cuda"):
+            _add_cuda_dll_dirs()
         from faster_whisper import WhisperModel  # lazy
 
         loop = asyncio.get_running_loop()

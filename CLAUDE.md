@@ -178,8 +178,13 @@ python local_loop.py --no-tts   # print speech instead of synthesizing it
 correctly; `--voice` captures and transcribes live mic audio; **live `--vision`
 works end-to-end** — the USB webcam (index 0) → Moondream on the GPU at
 ~0.6 s/image (torch **2.12.0+cu132**, CUDA 13.2, `sm_120`). All three modes
-(text / voice / vision) are verified. ASR still defaults to CPU
-(`--asr-device cuda` needs ctranslate2 CUDA libs).
+(text / voice / vision) are verified, all on the GPU.
+
+**GPU ASR:** Whisper runs on the GPU (~0.14 s/utterance, RTF 0.03 — vs ~3.7 s on
+CPU). ctranslate2's CUDA-12 build needs `cublas64_12.dll` + cuDNN 9, supplied by
+the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip packages (in `pyproject.toml`);
+`asr.py` registers their DLL dirs automatically when `device='cuda'`.
+`local_loop.py --voice` now defaults to GPU ASR.
 
 External binaries/models (paths in `config.toml`; override in gitignored
 `config.local.toml`) — **present on this machine**:
