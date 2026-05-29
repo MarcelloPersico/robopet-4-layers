@@ -101,7 +101,8 @@ plan's 2 Hz; see review note below.)
 | `tts.py` | Piper subprocess pool; sentence-streaming to local speaker | §4, §8 |
 | `motion.py` | Motion intents → Teensy JSON cmds (via WS UART channel) | §3.1 |
 | `mcp_server.py` | In-process MCP server: robot + queue tools (stdio + HTTP/SSE) | §3.3 |
-| `queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots | §8.4 |
+| `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. **Named `pet_queue`, not the plan's `queue`** — a module called `queue.py` shadows the stdlib `queue` that `concurrent.futures` imports for every `run_in_executor`, crashing the orchestrator. | §8.4 |
+| `tools.py` | Shared robot + queue tool implementations; both the agent loop and the MCP server call these in-process (Plan §8.7) | §3.3, §5.1 |
 | `state.py` | `WorldState`; recent-answers buffer (deque 50) | §8.3, §5.5 |
 | `notifier.py` | toast / webhook / silent, throttled (1 per 10 min) | §8.5 |
 | `cli_queue.py` | CLI to inspect/resolve/dismiss the queue | §9 M8 |

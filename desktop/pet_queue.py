@@ -1,6 +1,10 @@
 """Pending-questions queue: SQLite schema, CRUD, frame snapshots, and the
 resolved-knowledge table that feeds the recent-answers buffer. Plan §8.4, §5.5.
 
+(Module named ``pet_queue`` rather than the plan's ``queue`` to avoid shadowing
+Python's stdlib ``queue``, which ``concurrent.futures`` imports for every
+``run_in_executor`` call. See CLAUDE.md.)
+
 This is the heart of the "defer to a human" pattern that replaces automated
 cloud escalation: the agent writes a row via :meth:`queue_question`; a human
 (directly via cli_queue.py, or through Claude over MCP) resolves it; resolutions
