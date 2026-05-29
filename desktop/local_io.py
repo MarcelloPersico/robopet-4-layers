@@ -72,12 +72,23 @@ class LocalCamera:
         import cv2
 
         self._cv2 = cv2
-        self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        # Try the platform default (Media Foundation on Windows) first, then
+        # DirectShow as a fallback.
+        for backend in (0, getattr(cv2, "CAP_DSHOW", 0)):
+            cap = cv2.VideoCapture(self.device_index, backend) if backend else cv2.VideoCapture(self.device_index)
+            if cap.isOpened():
+                self._cap = cap
+                break
+            cap.release()
+        if self._cap is None:
+            raise RuntimeError(
+                f"could not open webcam index {self.device_index}. "
+                "Check the camera is connected and its driver is healthy "
+                "(Device Manager), and that nothing else is using it."
+            )
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"could not open webcam index {self.device_index}")
         self._task = asyncio.create_task(self._grab_loop())
         log.info("local webcam %d open", self.device_index)
 
