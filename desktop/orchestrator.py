@@ -17,8 +17,7 @@ import logging
 import signal
 from pathlib import Path
 
-import httpx
-
+import llama_server
 from agent import AgentBrain
 from asr import ASR
 from config import load_config
@@ -70,27 +69,8 @@ class Orchestrator:
     # --- llama.cpp subprocess -------------------------------------------------
     async def _launch_llama(self) -> None:
         a = self.cfg["agent"]
-        args = [
-            a["llama_server_exe"], "-m", a["model_path"],
-            "--host", a["host"], "--port", str(a["port"]),
-            "-ngl", str(a.get("n_gpu_layers", 99)), "-c", str(a.get("ctx_size", 8192)),
-            "--parallel", str(a.get("parallel", 1)),
-        ]
-        log.info("launching llama-server: %s", " ".join(args))
-        self._llama_proc = await asyncio.create_subprocess_exec(*args)
-        await self._wait_llama_ready(f"http://{a['host']}:{a['port']}")
-
-    async def _wait_llama_ready(self, base_url: str, timeout_s: float = 120.0) -> None:
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            while asyncio.get_running_loop().time() < deadline:
-                with contextlib.suppress(Exception):
-                    r = await client.get(f"{base_url}/health")
-                    if r.status_code == 200:
-                        log.info("llama-server ready")
-                        return
-                await asyncio.sleep(1.0)
-        raise RuntimeError("llama-server did not become ready in time")
+        self._llama_proc = await llama_server.launch(a)
+        await llama_server.wait_ready(f"http://{a['host']}:{a['port']}")
 
     # --- lifecycle ------------------------------------------------------------
     async def run(self) -> None:
