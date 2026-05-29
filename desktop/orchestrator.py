@@ -1,1 +1,234 @@
-"""Entry point. Asyncio main loop, supervises every other component. See plan §8."""
+"""Entry point. Asyncio main loop, supervises every other component. Plan §8.
+
+Process model (Plan §8.1): one asyncio process + the llama-server subprocess
+(launched here). GPU models (faster-whisper, Moondream2) and blocking I/O run in
+the default executor. The MCP HTTP binding runs in-process.
+
+Task graph (Plan §8.2): ws server, audio/control routers, ASR, agent, TTS
+player, telemetry, idle, health, MCP. Latency hiding (Plan §5.6): the ack
+animation dispatches the instant a transcript finalizes, before the agent loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import signal
+from pathlib import Path
+
+import httpx
+
+from agent import AgentBrain
+from asr import ASR
+from config import load_config
+from motion import Motion
+from notifier import Notifier
+from pet_queue import QueueDB
+from state import WorldState
+from tools import RobotTools
+from tts import TTS
+from vlm import VLM
+from wsserver import WsServer
+
+import mcp_server
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger("orchestrator")
+
+_HERE = Path(__file__).resolve().parent
+
+
+class Orchestrator:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.state = WorldState()
+        self.queue = QueueDB(_resolve(cfg["queue"]["db_path"]), _resolve(cfg["queue"]["frames_dir"]))
+
+        ws = cfg["wsserver"]
+        self.ws = WsServer(ws["host"], ws["port"], ws["ping_interval_s"], ws["ping_timeout_s"])
+        self.motion = Motion(self.ws)
+
+        self.asr = ASR(cfg["asr"]["model"], cfg["asr"]["device"], cfg["asr"]["compute_type"])
+        self.vlm = VLM(cfg["vlm"]["model"], cfg["vlm"]["device"], cfg["vlm"]["dtype"])
+        self.tts = TTS(cfg["tts"]["piper_exe"], cfg["tts"]["voice_model"], cfg["tts"].get("workers", 2))
+        self.notifier = Notifier(
+            cfg["notifier"]["backend"], cfg["notifier"]["throttle_seconds"], cfg["notifier"].get("webhook_url", "")
+        )
+        self.tools = RobotTools(self.motion, self.vlm, self.tts, self.queue, self.state, self.ws, self.notifier)
+
+        persona = (_HERE / cfg["paths"]["persona"]).read_text(encoding="utf-8")
+        a = cfg["agent"]
+        self.agent = AgentBrain(
+            base_url=f"http://{a['host']}:{a['port']}",
+            tools=self.tools, state=self.state, persona_text=persona,
+            temperature=a.get("temperature", 0.7),
+        )
+        self._llama_proc: asyncio.subprocess.Process | None = None
+        self._busy = asyncio.Lock()  # serialize agent turns / guard idle vs speech
+
+    # --- llama.cpp subprocess -------------------------------------------------
+    async def _launch_llama(self) -> None:
+        a = self.cfg["agent"]
+        args = [
+            a["llama_server_exe"], "-m", a["model_path"],
+            "--host", a["host"], "--port", str(a["port"]),
+            "-ngl", str(a.get("n_gpu_layers", 99)), "-c", str(a.get("ctx_size", 8192)),
+            "--parallel", str(a.get("parallel", 1)),
+        ]
+        log.info("launching llama-server: %s", " ".join(args))
+        self._llama_proc = await asyncio.create_subprocess_exec(*args)
+        await self._wait_llama_ready(f"http://{a['host']}:{a['port']}")
+
+    async def _wait_llama_ready(self, base_url: str, timeout_s: float = 120.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                with contextlib.suppress(Exception):
+                    r = await client.get(f"{base_url}/health")
+                    if r.status_code == 200:
+                        log.info("llama-server ready")
+                        return
+                await asyncio.sleep(1.0)
+        raise RuntimeError("llama-server did not become ready in time")
+
+    # --- lifecycle ------------------------------------------------------------
+    async def run(self) -> None:
+        await self.ws.start()
+        log.info("loading models...")
+        await asyncio.gather(self.asr.load(), self.vlm.load())
+        await self._launch_llama()
+
+        # Push drivetrain config + initial idle intensity to the Teensy.
+        await self.motion.set_idle_intensity(self.cfg["idle"].get("default_intensity", 0.6))
+
+        tasks = [
+            asyncio.create_task(self._audio_router(), name="audio_router"),
+            asyncio.create_task(self._control_router(), name="control_router"),
+            asyncio.create_task(self._telemetry_loop(), name="telemetry"),
+            asyncio.create_task(self.asr.run(on_final=self._on_utterance), name="asr"),
+            asyncio.create_task(self.tts.run(), name="tts"),
+            asyncio.create_task(self._idle_loop(), name="idle"),
+            asyncio.create_task(self._health_loop(), name="health"),
+            asyncio.create_task(self._serve_mcp(), name="mcp"),
+        ]
+        log.info("orchestrator running (%d tasks)", len(tasks))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.agent.aclose()
+        with contextlib.suppress(Exception):
+            await self.ws.close()
+        if self._llama_proc and self._llama_proc.returncode is None:
+            self._llama_proc.terminate()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._llama_proc.wait(), timeout=5.0)
+        self.queue.close()
+
+    # --- routers / loops ------------------------------------------------------
+    async def _audio_router(self) -> None:
+        while True:
+            self.asr.post_audio(await self.ws.audio_in.get())
+
+    async def _control_router(self) -> None:
+        while True:
+            msg = await self.ws.control_in.get()
+            if msg.get("type") == "vad":
+                self.asr.post_vad(msg.get("event", ""))
+
+    async def _telemetry_loop(self) -> None:
+        import json
+        while True:
+            line = await self.ws.uart_in.get()
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "telemetry":
+                self.state.set_telemetry(obj)
+
+    async def _on_utterance(self, text: str) -> None:
+        log.info("user: %s", text)
+        self.state.add_transcript(text)
+        # Latency hiding (Plan §5.6 step 1): visible reaction within ~300 ms.
+        await self.motion.play_animation("perk_up")
+        async with self._busy:
+            with contextlib.suppress(Exception):
+                await self.agent.handle_utterance(text)
+
+    async def _idle_loop(self) -> None:
+        import random
+        quiet = self.cfg["idle"].get("no_user_quiet_s", 30)
+        while True:
+            await asyncio.sleep(5.0)
+            if self._busy.locked() or not self.ws.connected:
+                continue
+            if self.state.idle_seconds() < quiet:
+                continue
+            roll = random.random()
+            async with self._busy:
+                if roll < 0.15 and self.ws.video_latest:
+                    desc = await self.tools.see()
+                    self.state.set_vision(desc)
+                elif roll < 0.30:
+                    await self.motion.play_animation(random.choice(["nod", "wiggle"]))
+                elif roll < 0.40 and self.queue.count_pending() >= self.cfg["queue"].get("mention_threshold", 5):
+                    await self.tts.say("i've got a few things i've been wondering about, if you want to take a look.")
+            self.state.mark_activity()  # don't fire again immediately
+
+    async def _health_loop(self) -> None:
+        while True:
+            await asyncio.sleep(10.0)
+            if self._llama_proc and self._llama_proc.returncode is not None:
+                log.error("llama-server exited (%s); relaunching", self._llama_proc.returncode)
+                with contextlib.suppress(Exception):
+                    await self._launch_llama()
+            log.debug("health: pi=%s pending=%d", self.ws.connected, self.queue.count_pending())
+
+    async def _serve_mcp(self) -> None:
+        m = self.cfg["mcp"]
+        if not m.get("enable_http", True):
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await mcp_server.serve_http(self.tools, m["http_host"], m["http_port"])
+
+
+def _resolve(path: str) -> str:
+    """Resolve a possibly-relative config path against the desktop/ directory."""
+    p = Path(path)
+    return str(p if p.is_absolute() else _HERE / p)
+
+
+async def _amain() -> None:
+    cfg = load_config()
+    orch = Orchestrator(cfg)
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    with contextlib.suppress(NotImplementedError):  # add_signal_handler is POSIX-only
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
+    runner = asyncio.create_task(orch.run())
+    done, _ = await asyncio.wait({runner, asyncio.create_task(stop.wait())}, return_when=asyncio.FIRST_COMPLETED)
+    if runner not in done:
+        runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
+
+
+def main() -> None:
+    try:
+        asyncio.run(_amain())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
