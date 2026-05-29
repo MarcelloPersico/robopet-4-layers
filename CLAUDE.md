@@ -186,9 +186,14 @@ the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip packages (in `pyproject.toml`
 `asr.py` registers their DLL dirs automatically when `device='cuda'`.
 `local_loop.py --voice` now defaults to GPU ASR.
 
+**LLM backend:** llama.cpp ships both a **Vulkan** and a **CUDA** build; both run
+the 7B at ~150 tok/s on the 5070 Ti (CUDA ~2% faster — Vulkan is not a
+bottleneck). Pick the build/port via `config.local.toml` (`[agent]
+llama_server_exe`, `port`).
+
 External binaries/models (paths in `config.toml`; override in gitignored
 `config.local.toml`) — **present on this machine**:
-- `C:/tools/llama.cpp/llama-server.exe` + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
+- `C:/tools/llama.cpp/llama-server.exe` (Vulkan) + `C:/tools/llama.cpp-cuda/` (CUDA 13.3) + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
 - `C:/tools/piper/piper.exe` + `C:/models/piper/en_US-amy-medium.onnx`
 - ASR `large-v3-turbo`, VLM `vikhyatk/moondream2` (auto-downloaded)
 
