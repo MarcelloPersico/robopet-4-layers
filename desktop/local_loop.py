@@ -168,8 +168,10 @@ def main() -> None:
     p.add_argument("--voice", action="store_true", help="use the desktop microphone (else text REPL)")
     p.add_argument("--vision", action="store_true", help="enable see() via the desktop webcam (loads Moondream)")
     p.add_argument("--no-tts", action="store_true", help="print speech instead of synthesizing it")
-    p.add_argument("--asr-device", default="cpu", choices=["cpu", "cuda"], help="Whisper device (default cpu)")
-    p.add_argument("--vlm-device", default="cpu", choices=["cpu", "cuda"], help="Moondream device (default cpu)")
+    p.add_argument("--asr-device", default="cpu", choices=["cpu", "cuda"],
+                   help="Whisper device (default cpu; cuda needs ctranslate2 CUDA libs)")
+    p.add_argument("--vlm-device", default="cuda", choices=["cpu", "cuda"],
+                   help="Moondream device (default cuda; verified ~0.6s/image on the 5070 Ti)")
     args = p.parse_args()
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(amain(args))
