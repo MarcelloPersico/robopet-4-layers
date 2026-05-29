@@ -175,12 +175,11 @@ python local_loop.py --no-tts   # print speech instead of synthesizing it
 ```
 **Verified on this machine (2026-05-29):** text loop runs fully on the GPU
 (llama.cpp **Vulkan** build, RTX 5070 Ti); Piper TTS + Whisper ASR round-trip
-correctly; `--voice` captures and transcribes live mic audio; **Moondream runs
-on the GPU at ~0.6 s/image** (torch **2.12.0+cu132**, CUDA 13.2, `sm_120`). The
-only thing blocking *live* `--vision` is the **USB webcam driver** (status
-*Unknown* — fix in Device Manager); the vision software itself is verified
-against a test image. ASR still defaults to CPU (`--asr-device cuda` needs
-ctranslate2 CUDA libs).
+correctly; `--voice` captures and transcribes live mic audio; **live `--vision`
+works end-to-end** — the USB webcam (index 0) → Moondream on the GPU at
+~0.6 s/image (torch **2.12.0+cu132**, CUDA 13.2, `sm_120`). All three modes
+(text / voice / vision) are verified. ASR still defaults to CPU
+(`--asr-device cuda` needs ctranslate2 CUDA libs).
 
 External binaries/models (paths in `config.toml`; override in gitignored
 `config.local.toml`) — **present on this machine**:
