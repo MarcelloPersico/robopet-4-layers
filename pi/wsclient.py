@@ -12,10 +12,11 @@ import logging
 from typing import Awaitable, Callable
 
 import websockets
+from websockets.asyncio.client import ClientConnection, connect
 
 log = logging.getLogger("wsclient")
 
-Handler = Callable[[websockets.WebSocketClientProtocol], Awaitable[None]]
+Handler = Callable[[ClientConnection], Awaitable[None]]
 
 
 async def run_with_reconnect(url: str, handler: Handler, min_s: float = 1.0, max_s: float = 30.0) -> None:
@@ -24,7 +25,7 @@ async def run_with_reconnect(url: str, handler: Handler, min_s: float = 1.0, max
     backoff = min_s
     while True:
         try:
-            async with websockets.connect(url, max_size=4 * 1024 * 1024, ping_interval=20) as ws:
+            async with connect(url, max_size=4 * 1024 * 1024, ping_interval=20) as ws:
                 log.info("connected to %s", url)
                 backoff = min_s  # reset on a successful connect
                 await handler(ws)

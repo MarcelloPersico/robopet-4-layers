@@ -94,7 +94,9 @@ plan's 2 Hz; see review note below.)
 | File | Role | Plan |
 |------|------|------|
 | `orchestrator.py` | asyncio entry point; supervises all tasks + subprocesses | §8 |
-| `wsserver.py` | Pi WS server; framing + channel demux | §3.2, §8 |
+| `config.py` | Loads `config.toml` + deep-merges `config.local.toml` overlay | §2.3 |
+| `protocol.py` | Channel-tagged WS frame encode/decode (mirrored in `pi/protocol.py`) | §3.2 |
+| `wsserver.py` | Pi WS server; framing + channel demux; multi-connection (bridge + capture) | §3.2, §8 |
 | `asr.py` | faster-whisper; streaming partial+final transcripts | §4 |
 | `vlm.py` | Moondream2 `describe(jpeg_bytes) -> str` | §4 |
 | `agent.py` | **Agent brain**: llama.cpp client, tool-call loop, prompt builder | §5 |
@@ -137,9 +139,13 @@ unresolved (max ~once/30 min).
 
 ## Components (pi/, teensy/)
 
-- `pi/bridge.py` (§7.1) — transparent UART↔WS forwarder + heartbeat.
+- `pi/bridge.py` (§7.1) — transparent UART↔WS forwarder + **2 Hz** local Teensy
+  heartbeat (keeps the body's watchdog fed independent of the desktop).
 - `pi/capture.py` (§7.2) — motion-gated JPEG (0x03) + VAD-gated PCM (0x02),
-  300 ms pre-roll / 500 ms hangover. **No ML on the Pi.**
+  300 ms pre-roll / 500 ms hangover, `vad start/end` control bracketing.
+  **No ML on the Pi.**
+- `pi/wsclient.py` — shared exponential-backoff reconnect loop.
+- `pi/protocol.py` — verbatim copy of `desktop/protocol.py` (keep in sync).
 - `pi/systemd/` — `pet-bridge.service`, `pet-capture.service` (user `pet`,
   `WorkingDirectory=/opt/pet`, `Restart=always`).
 - `teensy/src/main.cpp` (§6) — firmware. Real modules in M1/M2: MotorDriver,
@@ -181,10 +187,18 @@ pio run -e teensy41 -t upload   # 921600 monitor, teensy-cli upload
 ```
 
 ### Lint / test
-```bash
-ruff check .                    # line-length 100, py311
-pytest                          # pytest-asyncio for the async orchestrator
+A project virtualenv at `.venv/` (gitignored) holds the lightweight deps needed
+to lint and test without the GPU/hardware stack (heavy libs are lazy-imported):
+```powershell
+python -m venv .venv
+.\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
+.\.venv\Scripts\ruff check desktop pi      # clean
+.\.venv\Scripts\python -m pytest desktop   # 32 tests: protocol, queue, state, config,
+                                           #   tts splitter, tools, agent loop, ws loopback
+.\.venv\Scripts\python -m pytest pi        # 6 tests: protocol, VAD audio-gate
 ```
+Tests cover the hardware-/model-free logic. The Teensy firmware needs PlatformIO
+to build; the full orchestrator needs the models + a connected Pi/Teensy.
 
 ## Conventions
 

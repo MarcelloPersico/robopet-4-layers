@@ -18,7 +18,7 @@ Targets the official `mcp` Python SDK (FastMCP, mcp>=1.0).
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger("mcp_server")
 

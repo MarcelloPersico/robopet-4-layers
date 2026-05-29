@@ -17,7 +17,7 @@ import asyncio
 import logging
 
 import websockets
-from websockets.server import WebSocketServerProtocol
+from websockets.asyncio.server import ServerConnection, serve
 
 import protocol
 
@@ -51,8 +51,8 @@ class WsServer:
         self.video_latest: bytes | None = None  # most recent JPEG (motion-gated)
         self.video_event = asyncio.Event()
 
-        self._conns: set[WebSocketServerProtocol] = set()
-        self._uart_peer: WebSocketServerProtocol | None = None  # the bridge connection
+        self._conns: set[ServerConnection] = set()
+        self._uart_peer: ServerConnection | None = None  # the bridge connection
         self._server = None
 
     @property
@@ -60,7 +60,7 @@ class WsServer:
         return bool(self._conns)
 
     async def start(self) -> None:
-        self._server = await websockets.serve(
+        self._server = await serve(
             self._handler,
             self.host,
             self.port,
@@ -75,7 +75,7 @@ class WsServer:
             self._server.close()
             await self._server.wait_closed()
 
-    async def _handler(self, ws: WebSocketServerProtocol) -> None:
+    async def _handler(self, ws: ServerConnection) -> None:
         peer = getattr(ws, "remote_address", "?")
         log.info("Pi connected: %s", peer)
         self._conns.add(ws)
@@ -97,7 +97,7 @@ class WsServer:
                 self._uart_peer = None
             log.info("Pi disconnected: %s", peer)
 
-    def _route(self, ws: WebSocketServerProtocol, channel: int, payload: bytes) -> None:
+    def _route(self, ws: ServerConnection, channel: int, payload: bytes) -> None:
         if channel == protocol.CH_AUDIO:
             _put_drop_oldest(self.audio_in, payload)
         elif channel == protocol.CH_VIDEO:
@@ -129,7 +129,7 @@ class WsServer:
         results = [await self._send_to(ws, frame) for ws in list(self._conns)]
         return any(results)
 
-    async def _send_to(self, ws: WebSocketServerProtocol | None, frame: bytes) -> bool:
+    async def _send_to(self, ws: ServerConnection | None, frame: bytes) -> bool:
         if ws is None:
             return False
         try:
