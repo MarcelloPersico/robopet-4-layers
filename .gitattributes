@@ -1,0 +1,6 @@
+# Normalize line endings to LF — this tree runs on Linux (Pi), Teensy, and Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.onnx binary
+*.gguf binary
