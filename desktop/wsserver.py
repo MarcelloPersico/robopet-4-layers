@@ -3,7 +3,12 @@ channel-tagged frames, and provides the outbound path to the Teensy. Plan §3.2,
 
 Inbound frames are routed to bounded asyncio queues (drop-oldest on overflow for
 the non-critical media streams). Outbound motion/control is sent on the UART /
-control channels. Only one Pi is expected; a new connection supersedes the old.
+control channels.
+
+The Pi runs two services (Plan §7): pet-bridge (UART) and pet-capture (audio +
+video), so two connections arrive. Inbound frames from any connection are
+demuxed by channel; outbound UART is directed to whichever connection delivers
+UART traffic (the bridge).
 """
 
 from __future__ import annotations
@@ -46,12 +51,13 @@ class WsServer:
         self.video_latest: bytes | None = None  # most recent JPEG (motion-gated)
         self.video_event = asyncio.Event()
 
-        self._ws: WebSocketServerProtocol | None = None
+        self._conns: set[WebSocketServerProtocol] = set()
+        self._uart_peer: WebSocketServerProtocol | None = None  # the bridge connection
         self._server = None
 
     @property
     def connected(self) -> bool:
-        return self._ws is not None
+        return bool(self._conns)
 
     async def start(self) -> None:
         self._server = await websockets.serve(
@@ -72,7 +78,7 @@ class WsServer:
     async def _handler(self, ws: WebSocketServerProtocol) -> None:
         peer = getattr(ws, "remote_address", "?")
         log.info("Pi connected: %s", peer)
-        self._ws = ws
+        self._conns.add(ws)
         try:
             async for message in ws:
                 if isinstance(message, str):
@@ -82,21 +88,23 @@ class WsServer:
                 except protocol.ProtocolError as e:
                     log.warning("bad frame: %s", e)
                     continue
-                self._route(channel, payload)
+                self._route(ws, channel, payload)
         except websockets.ConnectionClosed:
             pass
         finally:
-            if self._ws is ws:
-                self._ws = None
+            self._conns.discard(ws)
+            if self._uart_peer is ws:
+                self._uart_peer = None
             log.info("Pi disconnected: %s", peer)
 
-    def _route(self, channel: int, payload: bytes) -> None:
+    def _route(self, ws: WebSocketServerProtocol, channel: int, payload: bytes) -> None:
         if channel == protocol.CH_AUDIO:
             _put_drop_oldest(self.audio_in, payload)
         elif channel == protocol.CH_VIDEO:
             self.video_latest = payload
             self.video_event.set()
         elif channel == protocol.CH_UART:
+            self._uart_peer = ws  # this connection is the bridge
             try:
                 line = payload.decode("utf-8").strip()
             except UnicodeDecodeError:
@@ -111,14 +119,17 @@ class WsServer:
 
     # --- outbound -------------------------------------------------------------
     async def send_uart(self, line: str) -> bool:
-        """Send one line-delimited JSON command to the Teensy (via the Pi)."""
-        return await self._send(protocol.encode_uart(line))
+        """Send one line-delimited JSON command to the Teensy via the bridge."""
+        peer = self._uart_peer or next(iter(self._conns), None)
+        return await self._send_to(peer, protocol.encode_uart(line))
 
     async def send_control(self, obj: dict) -> bool:
-        return await self._send(protocol.encode_control(obj))
+        """Broadcast a control message to every connected Pi service."""
+        frame = protocol.encode_control(obj)
+        results = [await self._send_to(ws, frame) for ws in list(self._conns)]
+        return any(results)
 
-    async def _send(self, frame: bytes) -> bool:
-        ws = self._ws
+    async def _send_to(self, ws: WebSocketServerProtocol | None, frame: bytes) -> bool:
         if ws is None:
             return False
         try:
