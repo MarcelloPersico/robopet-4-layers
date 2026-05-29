@@ -1,0 +1,18 @@
+[Unit]
+Description=Robot desk pet UART<->WebSocket bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pet
+Group=pet
+WorkingDirectory=/opt/pet
+ExecStart=/opt/pet/venv/bin/python /opt/pet/bridge.py
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

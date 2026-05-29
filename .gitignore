@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Teensy / PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Local data
+desktop/data/queue.sqlite
+desktop/data/queue.sqlite-journal
+desktop/data/queue.sqlite-wal
+desktop/data/queue.sqlite-shm
+desktop/data/pending_frames/*.jpg
+
+# Secrets / local config
+desktop/config.local.toml
+pi/config.local.toml
+
+# OS
+.DS_Store
+Thumbs.db

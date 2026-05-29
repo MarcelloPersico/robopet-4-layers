@@ -1,0 +1,27 @@
+# Pi-side configuration. Override on the device by editing in place; no
+# config.local.toml on the Pi (single deployment per device).
+
+[desktop]
+host = "192.168.1.10"  # set to the desktop's LAN address
+port = 8765
+reconnect_min_s = 1.0
+reconnect_max_s = 30.0
+
+[uart]
+device = "/dev/serial0"
+baud = 921600
+
+[camera]
+device_index = 0
+width = 640
+height = 480
+fps = 15
+motion_threshold = 8.0      # mean absdiff over downsampled grayscale
+keepalive_s = 2.0           # send a frame at least this often regardless of motion
+
+[audio]
+samplerate = 16000
+frame_ms = 20
+vad_aggressiveness = 2      # 0-3, webrtcvad
+preroll_ms = 300
+hangover_ms = 500

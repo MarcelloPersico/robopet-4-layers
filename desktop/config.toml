@@ -1,0 +1,62 @@
+# Desktop orchestrator configuration.
+# Copy to config.local.toml for machine-specific overrides; config.local.toml is gitignored.
+
+[wsserver]
+host = "0.0.0.0"
+port = 8765
+ping_interval_s = 2.0
+ping_timeout_s = 10.0
+
+[asr]
+model = "large-v3-turbo"
+compute_type = "int8_float16"
+device = "cuda"
+vad_filter = false  # VAD runs on the Pi
+
+[vlm]
+model = "vikhyatk/moondream2"
+device = "cuda"
+dtype = "float16"
+
+[agent]
+# llama.cpp server is launched as a subprocess by the orchestrator.
+llama_server_exe = "C:/tools/llama.cpp/llama-server.exe"
+model_path = "C:/models/qwen2.5-7b-instruct-q4_k_m.gguf"
+host = "127.0.0.1"
+port = 8080
+n_gpu_layers = 99
+ctx_size = 8192
+parallel = 1
+temperature = 0.7
+
+[tts]
+piper_exe = "C:/tools/piper/piper.exe"
+voice_model = "C:/models/piper/en_US-amy-medium.onnx"
+workers = 2
+
+[mcp]
+# stdio: invoked by Claude Desktop via claude_desktop_config.json
+# http:  bound on localhost for inspector / remote connectors
+enable_stdio = true
+enable_http = true
+http_host = "127.0.0.1"
+http_port = 8770
+http_bearer_token = "change-me-in-config.local.toml"
+
+[queue]
+db_path = "data/queue.sqlite"
+frames_dir = "data/pending_frames"
+recent_answers_max = 50
+mention_threshold = 5  # agent may mention queue if unresolved >= this many
+
+[notifier]
+backend = "toast"  # one of: toast, webhook, silent
+throttle_seconds = 600  # 10 minutes
+webhook_url = ""
+
+[paths]
+persona = "persona.md"
+
+[idle]
+no_user_quiet_s = 30
+default_intensity = 0.6
