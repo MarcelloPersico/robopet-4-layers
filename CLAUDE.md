@@ -163,8 +163,26 @@ pip install -e ".[dev]"
 python orchestrator.py          # launches llama-server, wsserver, asr, vlm, tts, mcp
 python cli_queue.py             # inspect / resolve / dismiss the queue
 ```
+
+#### Run locally without Pi or Teensy (`local_loop.py`, Plan §8.7)
+Talk to the pet brain on the desktop alone (desktop mic/webcam/speaker; motion
+is echoed to the console). Reuses the same `RobotTools` + `AgentBrain`.
+```powershell
+python local_loop.py            # text REPL (type to the pet)
+python local_loop.py --voice    # talk via the desktop mic (Whisper)
+python local_loop.py --voice --vision   # add see() via the webcam (Moondream)
+python local_loop.py --no-tts   # print speech instead of synthesizing it
+```
+**Verified on this machine (2026-05-29):** text loop runs fully on the GPU
+(llama.cpp **Vulkan** build, RTX 5070 Ti); Piper TTS + Whisper ASR round-trip
+correctly; `--voice` captures and transcribes live mic audio. **Vision is
+blocked** — the USB webcam driver shows status *Unknown* and no backend can open
+it (fix in Device Manager). The installed PyTorch is **CPU-only**, so Moondream
+would be slow; for GPU vision install a CUDA build
+(`pip install torch --index-url https://download.pytorch.org/whl/cu128`, Blackwell).
+
 External binaries/models (paths in `config.toml`; override in gitignored
-`config.local.toml`):
+`config.local.toml`) — **present on this machine**:
 - `C:/tools/llama.cpp/llama-server.exe` + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
 - `C:/tools/piper/piper.exe` + `C:/models/piper/en_US-amy-medium.onnx`
 - ASR `large-v3-turbo`, VLM `vikhyatk/moondream2` (auto-downloaded)
