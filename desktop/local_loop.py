@@ -158,6 +158,12 @@ def _banner(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    import sys
+    # The pet's console "body language" uses emoji; Windows consoles default to
+    # cp1252 and would crash on them. Emit UTF-8 (replace anything unrenderable).
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     p = argparse.ArgumentParser(description="Run the pet brain locally (no Pi/Teensy).")
     p.add_argument("--voice", action="store_true", help="use the desktop microphone (else text REPL)")
     p.add_argument("--vision", action="store_true", help="enable see() via the desktop webcam (loads Moondream)")
