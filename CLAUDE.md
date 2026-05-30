@@ -2,18 +2,20 @@
 
 Guidance for Claude Code working in this repository.
 
-> **Status:** This repo is a **scaffold**. Every Python module under `desktop/`
-> and `pi/` is currently a one-line docstring stub, the Teensy firmware is a
-> blink placeholder, and `pi/setup.sh` is unimplemented. The *configuration*
-> files are real and reflect the intended design.
+> **State (2026-05-30):**
+> - **`desktop/`** — fully implemented and verified on this machine; runs
+>   end-to-end (text / voice / vision). 62 tests pass (`desktop/tests`).
+> - **`pi/`** — implemented (`bridge.py`, `capture.py`, `wsclient.py`,
+>   `protocol.py`, `setup.sh`; 6 tests).
+> - **`teensy/`** — firmware implemented (`main.cpp` + MotorDriver, EncoderReader,
+>   PID, MotionPlanner, AnimationPlayer, ReflexEngine, CommandParser, Telemetry,
+>   Watchdog headers); not yet bench-verified on hardware (M1/M2 bringup).
 >
 > **Source of truth:** the full implementation plan (revision **r2**,
 > 2026-05-26) lives at
 > `C:\Users\persi\.claude\plans\project-robot-desk-abundant-lollipop.md`.
-> Every module docstring cites it as **"Plan §N"**. That file — not this one —
-> is authoritative; CLAUDE.md is the quick-reference summary.
->
-> Not a git repository yet (`git init` when ready to version).
+> Each module docstring cites it as **"Plan §N"**; that file is authoritative,
+> this is the quick-reference summary.
 
 ## What this is
 
@@ -25,69 +27,59 @@ pending-questions queue) instead of calling the cloud — the human later triage
 the queue by chatting with Claude over their own subscription, with the robot's
 tools attached via MCP.
 
-Design priorities (from the plan): **debuggability over peak performance**,
-**layered independence** (each tier testable alone), **latency hiding** (visible
-reaction within ~300 ms even while slow paths run), **never visibly inert** (the
-Teensy "breathes" autonomously), and **no pay-per-token surface** (the robot
-software itself makes zero outbound LLM calls).
+Design priorities: **debuggability over peak performance**, **layered
+independence** (each tier testable alone), **latency hiding** (visible reaction
+within ~300 ms even while slow paths run), **never visibly inert** (the Teensy
+"breathes" autonomously), and **no pay-per-token surface** (the robot software
+makes zero outbound LLM calls).
 
 ## Hardware (fixed — do not propose changes)
 
 - **Body — Teensy 4.1:** 2× brushed DC motors + quadrature encoders, **L298N**
   H-bridge, 2 driven wheels (differential drive) + 1 caster. No IMU, no display.
 - **Head — Raspberry Pi Zero 2 W:** Raspberry Pi OS Lite, headless. USB webcam
-  with integrated mic. Sits on the head; connects to the Teensy in the body via
-  UART + 5 V + GND through the neck.
+  with integrated mic. Connects to the Teensy via UART + 5 V + GND through the neck.
 - **Desktop:** Windows, **RTX 5070 Ti (16 GB VRAM)**, 64 GB RAM. Same LAN as Pi.
-- **Cloud:** the human's existing Claude **Pro/Max subscription** (Claude
-  Desktop or claude.ai) — used only when the *human* opens a chat. No API key.
+- **Cloud:** the human's existing Claude **Pro/Max subscription** — used only
+  when the *human* opens a chat. No API key.
 
 ## Four-tier architecture
 
 ```
   HUMAN ✕ CLAUDE  (Claude Desktop / claude.ai, subscription-billed)
-        │  connects on demand to triage the pending-questions queue
-        │  MCP (stdio or HTTP/SSE, localhost)
+        │  connects on demand to triage the pending-questions queue (MCP)
   ┌─────▼──────────────────────────── DESKTOP (Windows, 5070 Ti) ──────────┐
   │  orchestrator.py (single asyncio process)                              │
-  │   ├─ wsserver (:8765, to Pi)   ├─ tts (Piper, CPU)                      │
-  │   ├─ asr (faster-whisper, GPU) ├─ queue (SQLite + frame snapshots)      │
+  │   ├─ wsserver (:8765, to Pi)   ├─ tts (Piper/Kokoro, CPU)               │
+  │   ├─ asr (faster-whisper, GPU) ├─ pet_queue (SQLite + frame snapshots)  │
   │   ├─ vlm (Moondream2, GPU)     ├─ mcp_server (:8770, tools surface)     │
-  │   ├─ agent (llama.cpp srv,GPU) ├─ notifier (toast/webhook)             │
+  │   ├─ agent (OpenAI-compat,GPU) ├─ notifier (toast/webhook)             │
   │   └─ motion → Teensy cmds      └─ WorldState (+ recent-answers deque)   │
   └─────┬──────────────────────────────────────────────────────────────────┘
         │  WiFi LAN — single WebSocket, channel-tagged frames
   ┌─────▼──────────────── PI ZERO 2 W (head) ──────────┐
   │  bridge.py  : UART ↔ WS transparent fwd + heartbeat │
   │  capture.py : cam (motion-gated JPEG) + mic (VAD)   │
-  │  systemd: pet-bridge, pet-capture (Restart=always)  │
   └─────┬───────────────────────────────────────────────┘
         │  UART /dev/serial0 @ 921600 8N1, line-delimited JSON
   ┌─────▼──────────────── TEENSY 4.1 (body) ───────────┐
   │  1 kHz loop: PID/wheel · MotionPlanner · Animation  │
-  │  Player · ReflexEngine(idle) · CommandParser ·      │
-  │  Telemetry(50 Hz) · Watchdog → L298N → 2× DC+enc    │
+  │  · ReflexEngine(idle) · Telemetry · Watchdog → L298N│
   └─────────────────────────────────────────────────────┘
 ```
 
 The MCP server runs **in-process** in the orchestrator and exposes the *same*
 tool surface the local agent uses, plus the queue tools — so the human's Claude
 session and the local agent see the same robot through the same interface. The
-Teensy's USB serial stays exposed for bench bringup (desktop talks to it
-directly, skipping the Pi).
+Teensy's USB serial stays exposed for bench bringup.
 
-### Transport channels (Pi ↔ Desktop WebSocket, port 8765)
-- `0x01` control (JSON) · `0x02` audio (16 kHz PCM, **VAD-gated on Pi**) ·
-  `0x03` video (640×480 JPEG @ 15 fps, **motion-gated on Pi**) · `0x04` UART
-  passthrough. WS heartbeat 2 s; Pi reconnects with exponential backoff.
-  Worst-case ~5.6 Mbps.
-
-### Teensy ↔ Pi (UART)
-`/dev/serial0` @ **921600 8N1**, newline-delimited JSON. Commands down
-(`drive`, `stop`, `play`, `set_idle`, `ping`, `config`); telemetry/events up at
-50 Hz. **Heartbeat 2 Hz; Teensy link-loss → soft-stop at 1500 ms.** (Note:
-`bridge.py`'s docstring currently says "1 Hz heartbeat" — reconcile to the
-plan's 2 Hz; see review note below.)
+### Channels & links
+- **Pi ↔ Desktop WS (8765):** `0x01` control (JSON) · `0x02` audio (16 kHz PCM,
+  VAD-gated on Pi) · `0x03` video (640×480 JPEG @ 15 fps, motion-gated on Pi) ·
+  `0x04` UART passthrough. WS heartbeat 2 s; Pi reconnects with backoff.
+- **Teensy ↔ Pi UART:** `/dev/serial0` @ **921600 8N1**, newline-delimited JSON.
+  Commands down (`drive`, `stop`, `play`, `set_idle`, `ping`, `config`);
+  telemetry/events up at 50 Hz. Heartbeat 2 Hz; link-loss → soft-stop at 1500 ms.
 
 ## Components (desktop/)
 
@@ -96,99 +88,81 @@ plan's 2 Hz; see review note below.)
 | `orchestrator.py` | asyncio entry point; supervises all tasks + subprocesses | §8 |
 | `config.py` | Loads `config.toml` + deep-merges `config.local.toml` overlay | §2.3 |
 | `protocol.py` | Channel-tagged WS frame encode/decode (mirrored in `pi/protocol.py`) | §3.2 |
-| `wsserver.py` | Pi WS server; framing + channel demux; multi-connection (bridge + capture) | §3.2, §8 |
-| `asr.py` | faster-whisper; streaming partial+final transcripts | §4 |
+| `wsserver.py` | Pi WS server; framing + channel demux; multi-connection | §3.2, §8 |
+| `asr.py` | faster-whisper; streaming partial+final transcripts; anti-hallucination gate | §4 |
 | `vlm.py` | Moondream2 `describe(jpeg_bytes) -> str` | §4 |
-| `agent.py` | **Agent brain**: OpenAI-compatible client, tool-call loop, prompt builder; **streaming** (feeds `speak()` text to TTS as it generates) | §5 |
-| `llama_server.py` | Launch/readiness for the LLM server; `manages()` picks **managed** (we spawn llama.cpp) vs **external** (connect to a running server, e.g. LM Studio) | §5, §8.1 |
-| `tts.py` | Sentence-streaming TTS; pluggable backends via `build_tts()`: **`TTS`** (Piper, CPU, default) / **`KokoroTTS`** (Kokoro-82M neural). `BaseTTS` holds the shared player loop + half-duplex gate + echo hook | §4, §8 |
-| `half_duplex.py` | `SpeakingState` — mutes the mic while the pet speaks (+ hangover) so the speaker doesn't feed back into ASR in the single-box `local_loop` | §8.7 |
+| `agent.py` | Agent brain: OpenAI-compatible client, tool-call loop, prompt builder, streaming TTS | §5 |
+| `llama_server.py` | Launch/readiness; `manages()` picks managed (we spawn llama.cpp) vs external (e.g. LM Studio) | §5, §8.1 |
+| `tts.py` | Sentence-streaming TTS; `build_tts()` → `TTS` (Piper) / `KokoroTTS` (Kokoro-82M) | §4, §8 |
+| `half_duplex.py` | `SpeakingState` — mutes the mic while the pet speaks (anti-echo) | §8.7 |
 | `motion.py` | Motion intents → Teensy JSON cmds (via WS UART channel) | §3.1 |
-| `mcp_server.py` | In-process MCP server: robot + queue tools (stdio + HTTP/SSE) | §3.3 |
-| `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. **Named `pet_queue`, not the plan's `queue`** — a module called `queue.py` shadows the stdlib `queue` that `concurrent.futures` imports for every `run_in_executor`, crashing the orchestrator. | §8.4 |
-| `tools.py` | Shared robot + queue tool implementations; both the agent loop and the MCP server call these in-process (Plan §8.7) | §3.3, §5.1 |
+| `mcp_server.py` | In-process MCP server: robot + queue tools (HTTP/SSE in-process; stdio standalone) | §3.3 |
+| `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. Named `pet_queue` (not `queue`) to avoid shadowing the stdlib `queue` that `concurrent.futures` imports. | §8.4 |
+| `tools.py` | Shared robot + queue tool implementations; agent loop and MCP server both call these in-process | §3.3, §5.1 |
 | `state.py` | `WorldState`; recent-answers buffer (deque 50) | §8.3, §5.5 |
 | `notifier.py` | toast / webhook / silent, throttled (1 per 10 min) | §8.5 |
 | `cli_queue.py` | CLI to inspect/resolve/dismiss the queue | §9 M8 |
+| `local_loop.py` | Run the pet brain on the desktop alone (no Pi/Teensy) | §8.7 |
 | `persona.md` | Static, prefix-cacheable system-prompt portion | §5.4 |
 
 ### Agent loop (§5)
-Local **Qwen2.5-7B-Instruct (Q4_K_M GGUF)** via a `llama-server.exe` subprocess
-(`127.0.0.1:8080`, `n_gpu_layers=99`, `ctx_size=8192`), OpenAI-compatible
-function-calling. Tools: `drive`, `play_animation`, `stop`, `see`, `speak`,
-`set_idle_intensity`, and **`queue_question`** (the deferral path). System prompt
-= static `persona.md` (identity, rules, tool schemas, **deferral policy**, idle
-guidance) + dynamic (recent-answers buffer, last ~6 turns, recent `see()`,
-telemetry one-liner, new utterance).
+Local LLM via an OpenAI-compatible server (managed `llama-server.exe` or external
+LM Studio), function-calling. Tools: `drive`, `play_animation`, `stop`, `see`,
+`speak`, `set_idle_intensity`, and **`queue_question`** (the deferral path).
+System prompt = static `persona.md` + dynamic context (recent-answers buffer,
+last ~6 turns, recent `see()`, telemetry one-liner, new utterance).
 
-**Deferral criteria (§5.2)** — call `queue_question` only when at least one
-holds: low object-identity confidence, reasoning beyond ~3 steps, opinion/
-judgment beyond competence, or genuine novelty (would be a guess). Otherwise
-answer locally. *Do not queue trivial questions.*
+**Deferral criteria (§5.2)** — call `queue_question` only when at least one holds:
+low object-identity confidence, reasoning beyond ~3 steps, opinion/judgment
+beyond competence, or genuine novelty. Otherwise answer locally; don't queue
+trivial questions.
 
-### Runtime switches (set in gitignored `config.local.toml`)
-The committed `config.toml` holds **portable defaults**; per-machine choices go
-in `config.local.toml` (deep-merged over it). The pluggable seams added since the
-original scaffold:
-
-- **`[agent] manage_server`** — `true` (default) launches & owns `llama-server.exe`;
-  `false` connects to an already-running OpenAI-compatible server. Set `false` +
-  `port`/`model` to drive the pet from **LM Studio** (pick/swap models in its UI).
-  `wait_ready` probes `/health` (llama.cpp) and `/v1/models` (LM Studio).
-- **`[agent] stream`** — `true` (default) streams the reply and feeds the
-  `speak()` text to TTS sentence-by-sentence (audio starts before a long answer
-  finishes). Only the `speak()` channel is voiced — a reasoning model's private
-  `content` is never spoken. Falls back to buffered if the TTS isn't streamable.
-- **`[agent] model`** — id sent in the request; llama.cpp ignores it, LM Studio
-  uses it to select the loaded model.
-- **`[vlm] mode`** — `split` (default): Moondream captions frames for `see()`,
-  most debuggable. `unified`: **no separate VLM** — the agent LLM must itself be
-  multimodal (e.g. a Qwen3-VL/Gemma vision model in LM Studio); `see()` injects
-  the raw JPEG as an `image_url` message (`agent.py:_attach_pending_images`) and
-  the LLM sees pixels. Frees the VLM's ~3 GB but couples seeing + reasoning.
-- **`[tts] backend`** — `piper` (default, CPU) or `kokoro` (Kokoro-82M neural,
-  far more natural; `kokoro_voice`/`kokoro_device`). `build_tts()` selects it.
-- **`[asr] vad_filter`** — `false` by default; `true` adds faster-whisper's
-  Silero VAD on the final pass. ASR also has **always-on anti-hallucination**:
-  an RMS energy gate + per-segment `no_speech_prob`/`avg_logprob` filtering +
-  `condition_on_previous_text=False`, temperature 0, and a bare-phrase blocklist
-  (kills the "Thank you."/"you" phantoms Whisper emits on silence).
-
-**This machine's live config (2026-05-30):** LM Studio serving **Gemma-4-26B-A4B**
-(multimodal MoE, 4 B active) on `:1234` (`manage_server=false`), `mode="unified"`
-(Gemma sees frames itself), `stream=true`, `backend="kokoro"` (CPU). Gemma at Q4
-(~14–15 GB) spills experts to RAM — tolerable for an A4B MoE. Tool-calling +
-vision verified working through LM Studio.
-
-### Deferred-question pattern (§5, §8.4) — this is the cloud replacement
+### Defer-to-human loop (§5, §8.4) — the cloud replacement
 `queue_question` → SQLite row + saved camera frame + pose/excerpt snapshot →
-async notification (toast, throttled). The agent immediately speaks a short
-in-character ack and continues. The human triages later via `cli_queue.py` or by
-chatting with Claude (MCP tools: `list_pending_questions`, `get_pending_question`
-— inlines the JPEG —, `resolve_pending_question(..., share_with_robot=true)`,
-`dismiss_pending_question`, `summarize_queue`). Resolutions with
-`share_with_robot=true` land in the **recent-answers buffer** (deque 50,
-persisted to `resolved_knowledge`) and are injected into the prompt every turn,
-so the robot stops re-asking. Eviction is by recency, not relevance (deliberately
-simple). The agent may mention the backlog conversationally once it exceeds ~5
-unresolved (max ~once/30 min).
+throttled toast. The agent speaks a short in-character ack and continues. The
+human triages later via `cli_queue.py` or by chatting with Claude over MCP
+(`list_pending_questions`, `get_pending_question` (inlines the JPEG),
+`resolve_pending_question(..., share_with_robot=true)`, `dismiss_pending_question`,
+`summarize_queue`). Shared resolutions land in `resolved_knowledge`.
+
+The robot **learns answers back** two ways: the in-process HTTP path updates the
+live `WorldState` recent-answers buffer immediately; the stdio (Claude Desktop)
+path persists to the DB, and **`orchestrator.run()` seeds the buffer from
+`resolved_knowledge` at boot** (`state.load_resolutions(queue.load_recent_resolutions())`).
+Either way the buffer is injected into the prompt every turn, so the robot stops
+re-asking. Eviction is by recency (deliberately simple). See **`desktop/MCP_SETUP.md`**
+for wiring Claude Desktop (stdio) or the HTTP/SSE binding.
+
+### Runtime switches (gitignored `config.local.toml`, deep-merged over `config.toml`)
+- **`[agent] manage_server`** — `true` launches & owns `llama-server.exe`;
+  `false` connects to a running OpenAI-compatible server (e.g. LM Studio).
+- **`[agent] stream`** — `true` streams the reply and feeds `speak()` text to TTS
+  sentence-by-sentence. Only `speak()` is voiced; private reasoning is never spoken.
+- **`[agent] model`** — id sent in the request (llama.cpp ignores it; LM Studio selects on it).
+- **`[vlm] mode`** — `split` (Moondream captions frames for `see()`, default) or
+  `unified` (no separate VLM; the agent LLM is multimodal and `see()` injects the
+  raw JPEG as an `image_url`).
+- **`[tts] backend`** — `piper` (CPU, default) or `kokoro` (Kokoro-82M neural).
+- **`[asr] vad_filter`** — adds Silero VAD on the final pass; off by default.
+- **`[mcp]`** — `enable_http`/`http_host`/`http_port`/`http_bearer_token` for the
+  HTTP/SSE binding (localhost-only by default), `enable_stdio` for Claude Desktop.
+
+**This machine's live config:** LM Studio serving **Gemma-4-26B-A4B** (multimodal
+MoE) on `:1234` (`manage_server=false`), `mode="unified"`, `stream=true`,
+`backend="kokoro"` (CPU). Tool-calling + vision verified through LM Studio.
 
 ## Components (pi/, teensy/)
 
-- `pi/bridge.py` (§7.1) — transparent UART↔WS forwarder + **2 Hz** local Teensy
-  heartbeat (keeps the body's watchdog fed independent of the desktop).
+- `pi/bridge.py` (§7.1) — transparent UART↔WS forwarder + **2 Hz** Teensy heartbeat.
 - `pi/capture.py` (§7.2) — motion-gated JPEG (0x03) + VAD-gated PCM (0x02),
-  300 ms pre-roll / 500 ms hangover, `vad start/end` control bracketing.
-  **No ML on the Pi.**
+  300 ms pre-roll / 500 ms hangover. **No ML on the Pi.**
 - `pi/wsclient.py` — shared exponential-backoff reconnect loop.
 - `pi/protocol.py` — verbatim copy of `desktop/protocol.py` (keep in sync).
-- `pi/systemd/` — `pet-bridge.service`, `pet-capture.service` (user `pet`,
-  `WorkingDirectory=/opt/pet`, `Restart=always`).
-- `teensy/src/main.cpp` (§6) — firmware. Real modules in M1/M2: MotorDriver,
-  EncoderReader, PID, MotionPlanner, AnimationPlayer, ReflexEngine, CommandParser,
-  Telemetry, Watchdog. Loops: control 1 kHz, telemetry 50 Hz, reflex 10 Hz,
-  watchdog 100 Hz. Safety: link timeout 1500 ms → soft stop; stall → fault;
-  PWM ceiling 90 %.
+- `pi/systemd/` — `pet-bridge.service`, `pet-capture.service` (`Restart=always`).
+- `teensy/src/main.cpp` + headers (§6) — firmware: MotorDriver, EncoderReader,
+  PID, MotionPlanner, AnimationPlayer, ReflexEngine, CommandParser, Telemetry,
+  Watchdog. Loops: control 1 kHz, telemetry 50 Hz, reflex 10 Hz, watchdog 100 Hz.
+  Safety: link timeout 1500 ms → soft stop; stall → fault; PWM ceiling 90 %.
 
 ## Build / run
 
@@ -196,86 +170,56 @@ unresolved (max ~once/30 min).
 ```powershell
 cd desktop
 pip install -e ".[dev]"
-python orchestrator.py          # launches llama-server, wsserver, asr, vlm, tts, mcp
+python orchestrator.py          # launches the LLM server, wsserver, asr, vlm, tts, mcp
 python cli_queue.py             # inspect / resolve / dismiss the queue
 ```
 
-#### Run locally without Pi or Teensy (`local_loop.py`, Plan §8.7)
-Talk to the pet brain on the desktop alone (desktop mic/webcam/speaker; motion
-is echoed to the console). Reuses the same `RobotTools` + `AgentBrain`.
+Run on the desktop alone (no Pi/Teensy; motion echoed to console):
 ```powershell
-python local_loop.py            # text REPL (type to the pet)
-python local_loop.py --voice    # talk via the desktop mic (Whisper)
+python local_loop.py            # text REPL
+python local_loop.py --voice            # mic (Whisper, GPU by default)
 python local_loop.py --voice --vision   # add see() via the webcam (Moondream)
-python local_loop.py --no-tts   # print speech instead of synthesizing it
+python local_loop.py --no-tts           # print speech instead of synthesizing
 ```
-**Verified on this machine (2026-05-29):** text loop runs fully on the GPU
-(llama.cpp **Vulkan** build, RTX 5070 Ti); Piper TTS + Whisper ASR round-trip
-correctly; `--voice` captures and transcribes live mic audio; **live `--vision`
-works end-to-end** — the USB webcam (index 0) → Moondream on the GPU at
-~0.6 s/image (torch **2.12.0+cu132**, CUDA 13.2, `sm_120`). All three modes
-(text / voice / vision) are verified, all on the GPU.
 
-**Update (2026-05-30):** now also verified with the **LM Studio + Gemma-4-26B-A4B**
-brain (`manage_server=false`, `mode="unified"` so Gemma sees frames itself),
-**streaming TTS**, **Kokoro** neural voice (installed in the runtime Python; CPU),
-and **half-duplex** mic gating (no self-hearing). See "Runtime switches" above.
-`local_loop.py` flags: `--mic-hangover` (half-duplex tail), `--asr-device`,
-`--vlm-device`.
-
-**GPU ASR:** Whisper runs on the GPU (~0.14 s/utterance, RTF 0.03 — vs ~3.7 s on
-CPU). ctranslate2's CUDA-12 build needs `cublas64_12.dll` + cuDNN 9, supplied by
-the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip packages (in `pyproject.toml`);
-`asr.py` registers their DLL dirs automatically when `device='cuda'`.
-`local_loop.py --voice` now defaults to GPU ASR.
-
-**LLM backend:** llama.cpp ships both a **Vulkan** and a **CUDA** build; both run
-the 7B at ~150 tok/s on the 5070 Ti (CUDA ~2% faster — Vulkan is not a
-bottleneck). Pick the build/port via `config.local.toml` (`[agent]
-llama_server_exe`, `port`).
-
-External binaries/models (paths in `config.toml`; override in gitignored
-`config.local.toml`) — **present on this machine**:
-- `C:/tools/llama.cpp/llama-server.exe` (Vulkan) + `C:/tools/llama.cpp-cuda/` (CUDA 13.3) + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
+External binaries/models (paths in `config.toml`; override in `config.local.toml`):
+- `C:/tools/llama.cpp/llama-server.exe` (Vulkan) + `C:/tools/llama.cpp-cuda/` (CUDA)
+  + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
 - `C:/tools/piper/piper.exe` + `C:/models/piper/en_US-amy-medium.onnx`
 - ASR `large-v3-turbo`, VLM `vikhyatk/moondream2` (auto-downloaded)
-- **Kokoro-82M** (`pip install kokoro` → `misaki` G2P + `espeakng-loader` +
-  spaCy `en_core_web_sm`, all in the runtime Python; model auto-downloads from
-  `hexgrad/Kokoro-82M`). **LM Studio** runs `google/gemma-4-26b-a4b` on `:1234`.
+- Kokoro-82M (`pip install kokoro`, auto-downloads); LM Studio runs Gemma on `:1234`
 
-**VRAM budget (§4):** ASR ~1.6 GB + VLM ~3.0 GB + Qwen2.5-7B ~5.5 GB + ~1.5 GB
-KV ≈ **11.6 GB resident of 16 GB** (~4 GB margin). Piper is CPU-only.
+GPU notes: Whisper runs on GPU (~0.14 s/utterance) via ctranslate2's CUDA-12 build
+(`nvidia-cublas-cu12` + `nvidia-cudnn-cu12`; `asr.py` registers their DLL dirs).
+torch **2.12.0+cu132** (CUDA 13.2, `sm_120`) for Moondream. **VRAM budget (§4):**
+ASR ~1.6 GB + VLM ~3.0 GB + 7B ~5.5 GB + ~1.5 GB KV ≈ 11.6 GB of 16 GB.
 
 ### Pi (Raspberry Pi Zero 2 W)
 ```bash
-sudo ./setup.sh                 # STUB (M3): venv /opt/pet, apt deps, enable units
+sudo ./setup.sh                 # provisions venv /opt/pet, apt deps, systemd units
 sudo systemctl enable --now pet-bridge pet-capture
 ```
-Edit `pi/config.toml` in place (set `[desktop].host`). No `config.local.toml` on
-the Pi.
+Edit `pi/config.toml` in place (set `[desktop].host`). No `config.local.toml` on the Pi.
 
 ### Teensy 4.1 (PlatformIO + Teensyduino)
 ```bash
-cd teensy
-pio run -e teensy41 -t upload   # 921600 monitor, teensy-cli upload
+cd teensy && pio run -e teensy41 -t upload
 ```
 
 ### Lint / test
-A project virtualenv at `.venv/` (gitignored) holds the lightweight deps needed
-to lint and test without the GPU/hardware stack (heavy libs are lazy-imported):
+A `.venv/` (gitignored) holds the lightweight deps to lint/test without the
+GPU/hardware stack (heavy libs are lazy-imported):
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
-.\.venv\Scripts\ruff check desktop pi      # clean
-.\.venv\Scripts\python -m pytest desktop   # 57 tests: protocol, queue, state, config,
-                                           #   tts (splitter + Kokoro + backend factory),
-                                           #   tools (+ unified vision), agent loop (+ streaming
-                                           #   + image inject), asr anti-hallucination,
-                                           #   half-duplex gate, ws loopback
-.\.venv\Scripts\python -m pytest pi        # 6 tests: protocol, VAD audio-gate
+.\.venv\Scripts\ruff check desktop pi          # clean
+.\.venv\Scripts\python -m pytest desktop       # 62 tests (protocol, queue, state, config,
+                                               #   tts, tools, agent loop, asr, half-duplex,
+                                               #   ws loopback, MCP defer-to-human end-to-end)
+.\.venv\Scripts\python -m pytest pi            # 6 tests (protocol, VAD audio-gate)
 ```
-Tests cover the hardware-/model-free logic. The Teensy firmware needs PlatformIO
-to build; the full orchestrator needs the models + a connected Pi/Teensy.
+The Teensy firmware needs PlatformIO; the full orchestrator needs the models + a
+connected Pi/Teensy.
 
 ## Conventions
 
@@ -289,88 +233,43 @@ to build; the full orchestrator needs the models + a connected Pi/Teensy.
   wire protocol is for the *human's* Claude client only (§8.7). Don't route the
   local loop through the MCP socket.
 - Robot never drives motors directly — always via the Teensy's high-level cmds.
-- Gitignored artifacts: `data/queue.sqlite*`, `data/pending_frames/*.jpg`,
-  `__pycache__`, `.pio/`, `.venv/`, `config.local.toml`.
+- Gitignored: `data/queue.sqlite*`, `data/pending_frames/*.jpg`, `__pycache__`,
+  `.pio/`, `.venv/`, `config.local.toml`.
 
 ## Build & test order (§9)
 
 | M | Goal |
 |---|------|
-| M1 | Teensy motion bringup (USB serial only): MotorDriver/Encoder/PID/MotionPlanner/CommandParser |
+| M1 | Teensy motion bringup (USB serial): MotorDriver/Encoder/PID/MotionPlanner/CommandParser |
 | M2 | Teensy animations + ReflexEngine idle + Watchdog (unplug → stop ≤1.5 s) |
 | M3 | Pi bridge bringup (UART↔WS through the neck); systemd `Restart=always` |
 | M4 | Pi capture: motion-gated JPEG + VAD-bounded PCM on correct channels |
-| M5 | Desktop models concurrently (verify VRAM < 13 GB); wav → ASR → agent → TTS |
+| M5 | Desktop models concurrently (VRAM < 13 GB); wav → ASR → agent → TTS |
 | M6 | Full voice loop + motion; tune "ack within ~300 ms" |
 | M7 | VLM `see()` into the agent; 30-min sustained-operation test |
-| M8 | Pending-questions queue + `queue_question` + `cli_queue.py` + recent-answers buffer |
-| M9 | MCP server (stdio + HTTP/SSE) + Claude Desktop end-to-end + toast notifier |
+| M8 | Pending-questions queue + `queue_question` + `cli_queue.py` + recent-answers buffer ✅ |
+| M9 | MCP server (stdio + HTTP/SSE) + Claude Desktop end-to-end + toast notifier ✅ |
 | M10 | Persona + animation library + idle/TTS/ack polish |
 | M11 | Reliability hardening: fault injection, structured logging, webhook backend |
 
----
-
-## Architecture review — notes & open risks
-
-Reviewed by Claude (Opus 4.8) against plan r2. The design is **sound** and
-notably well-reasoned: clean tier independence, local reflexes that keep the body
-safe through Pi/desktop dropout, an explicit latency-hiding order of operations,
-and a deliberate no-API-key posture. The plan already anticipates most failure
-modes (§8.7) and carries its own revisit triggers (§10). Items below are things
-to **validate while building**, not design flaws.
+## Open risks (validate while building)
 
 1. **Pi UART at 921600 needs the PL011, not the mini-UART.** On the Pi Zero 2 W,
-   `/dev/serial0` defaults to the mini-UART (Bluetooth holds the stable PL011),
-   whose baud tracks the core clock and is flaky at high rates. Add
-   `dtoverlay=disable-bt` + disable the serial console so PL011 lands on the GPIO
-   header — or drop the baud. **Bake this into `setup.sh` (M3).** Not mentioned
-   in §7.
+   `/dev/serial0` defaults to the mini-UART (flaky at high baud). Add
+   `dtoverlay=disable-bt` + disable the serial console — bake into `setup.sh` (M3).
+2. **Firmware must read the Pi link on `Serial1`, not USB `Serial`.** USB serial
+   is bench-only (M1); production is Pi→Teensy on pins 0/1 = `Serial1`. Keep signal
+   at 3.3 V (Teensy 4.1 pins are not 5 V tolerant; the neck's 5 V is power only).
+3. **Pi↔Desktop WS is unauthenticated and binds `0.0.0.0:8765`.** Anyone on the
+   LAN could drive motors or read A/V. Mirror the MCP bearer token, or bind to the
+   Pi's address + firewall. The MCP HTTP binding already warns if bound off-localhost
+   with the default token; the WS link still needs the same treatment.
+4. **VRAM is tight** (~11.6 GB of 16 GB). M5's "< 13 GB" gate is the real check;
+   watch fragmentation across the three resident models.
 
-2. **Firmware must read the Pi link on `Serial1`, not USB `Serial`.** The plan
-   uses USB serial for bench bringup (M1) — correct — but the production path is
-   Pi→Teensy UART on pins 0/1 = `Serial1`. The placeholder uses USB `Serial`;
-   `CommandParser`/`Telemetry` need to bind `Serial1` (ideally both, switchable).
-   Voltages are fine (both 3.3 V; the "5 V through the neck" is power, not signal
-   — and Teensy 4.1 pins are **not** 5 V tolerant, so keep signal at 3.3 V).
-
-3. **Pi↔Desktop WebSocket is unauthenticated and binds `0.0.0.0:8765`.** §3.2
-   defines no handshake auth, so anyone on the LAN could connect, drive the
-   motors, or read the camera/mic streams. The MCP HTTP binding already uses a
-   bearer token (§3.3) — mirror that on the WS link, or bind to the Pi's
-   specific address + firewall. The A/V feed is the bigger privacy exposure.
-
-4. **Heartbeat-rate inconsistency.** `bridge.py`'s docstring says "1 Hz
-   heartbeat"; plan §3.1 says **2 Hz** with a 1500 ms Teensy link-loss timeout.
-   At 1 Hz a single dropped heartbeat (2000 ms gap) trips a false fault; 2 Hz
-   (500 ms) is the safe choice. Reconcile the docstring to the plan.
-
-5. **The pet speaks from the desktop, not its body.** `tts.py`/§8.2 send TTS to
-   the *desktop* local speaker, and there's no downstream audio channel to the
-   Pi. That's a legitimate choice for a desk pet sitting by the PC — just confirm
-   it's intended; giving it a body-voice would mean adding a Pi-ward audio
-   channel + playback.
-
-6. **VRAM is tight but accounted for.** §4 budgets ~11.6 GB on the 16 GB 5070 Ti.
-   Realistic — but Windows/WDDM reserves VRAM and KV grows with context, so M5's
-   "< 13 GB" gate is the real check. Watch fragmentation across the three
-   resident models; §8.7's OOM-reload path is the backstop.
-
-7. **Default bearer token.** `http_bearer_token = "change-me-in-config.local.toml"`
-   — consider failing fast if it's left at the default while `enable_http = true`.
-
-### On the original ask — "Opus 4.8 released, revise the plan"
-
-**No plan change is required, and that's by design.** Plan **r2 deliberately
-removed** the automated `ask_claude` cloud path (r1 had it); cloud capability now
-arrives only through the *human's* Claude subscription chat over MCP. That makes
-the architecture **model-agnostic on the cloud side** — Opus 4.8 shipping simply
-means the human's triage chats are now smarter, with nothing in the repo to
-update. There is no cloud model ID pinned anywhere to bump.
-
-The one place a future model *could* re-enter automatically is §10's deferred
-item: the Anthropic Agent SDK's expected **2026-06-15** monthly subscription
-credit for Pro/Max users, which would make an automated escalation path feasible
-*alongside* (not replacing) the queue. That remains explicitly deferred, and per
-your instruction the architecture stays as-is. If you ever want to revisit it,
-`agent.py` (§5 tool set) is the single seam — but it's a §10 decision, not a
-consequence of Opus 4.8's release.
+**Cloud is human-only by design.** Plan r2 deliberately removed the automated
+cloud path; cloud capability arrives only through the human's Claude subscription
+chat over MCP. The architecture is model-agnostic on the cloud side. The one place
+a future model could re-enter automatically is §10's deferred Agent-SDK
+subscription-credit item — `agent.py` (§5 tool set) is the single seam, but it's a
+§10 decision, kept deferred.
