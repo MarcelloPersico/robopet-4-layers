@@ -8,9 +8,16 @@ AgentBrain unchanged; only the I/O endpoints differ (see local_io.py).
     python local_loop.py --voice         # talk via the desktop mic
     python local_loop.py --voice --vision  # also enable see() via the webcam
     python local_loop.py --no-tts        # don't synthesize speech (print only)
+    python local_loop.py --voice --mcp   # + expose the live MCP HTTP server so the
+                                         #   human's Claude can drive this same pet
 
 Needs the llama-server + Qwen GGUF from config (the agent brain). Whisper is
 only loaded in --voice mode; Moondream + webcam only with --vision.
+
+With --mcp the same RobotTools that the local loop uses are also served over the
+MCP HTTP/SSE binding ([mcp] in config) — so a Claude client (Claude Desktop via
+the mcp-remote bridge, or the inspector) drives the *live* pet and shares its
+WorldState, exactly as in the full orchestrator (Plan §3.3, §8.7).
 """
 
 from __future__ import annotations
@@ -116,6 +123,19 @@ async def amain(args: argparse.Namespace) -> None:
             await tts.load()  # pre-warm (no-op for Piper; loads Kokoro's model)
             tasks.append(asyncio.create_task(tts.run()))
 
+        # Optionally expose the live MCP HTTP server against this very pet, so a
+        # human's Claude can drive the same RobotTools / WorldState the local loop
+        # uses (the "invoke Claude live" half of the deferral story). Plan §3.3, §8.7.
+        if args.mcp:
+            import mcp_server
+            m = cfg["mcp"]
+            tasks.append(asyncio.create_task(
+                mcp_server.serve_http(tools, m["http_host"], m["http_port"]),
+                name="mcp_http",
+            ))
+            log.info("MCP HTTP server on http://%s:%s/mcp — Claude can drive this pet",
+                     m["http_host"], m["http_port"])
+
         async def handle(text: str) -> None:
             print(f"\n🧑 {text}")
             with contextlib.suppress(Exception):
@@ -166,6 +186,8 @@ def _banner(args: argparse.Namespace) -> None:
         extras.append("vision")
     if args.no_tts:
         extras.append("no-tts")
+    if args.mcp:
+        extras.append("mcp")
     print(f"\n=== robot desk pet — local loop ({mode}{', ' + ', '.join(extras) if extras else ''}) ===")
     print("    (no Teensy: movements are printed; no Pi: using desktop mic/webcam)\n")
 
@@ -181,6 +203,8 @@ def main() -> None:
     p.add_argument("--voice", action="store_true", help="use the desktop microphone (else text REPL)")
     p.add_argument("--vision", action="store_true", help="enable see() via the desktop webcam (loads Moondream)")
     p.add_argument("--no-tts", action="store_true", help="print speech instead of synthesizing it")
+    p.add_argument("--mcp", action="store_true",
+                   help="also serve the live MCP HTTP binding so Claude can drive this pet")
     p.add_argument("--asr-device", default="cuda", choices=["cpu", "cuda"],
                    help="Whisper device (default cuda; ~0.14s/utterance on the 5070 Ti)")
     p.add_argument("--vlm-device", default="cuda", choices=["cpu", "cuda"],

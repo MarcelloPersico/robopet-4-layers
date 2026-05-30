@@ -41,19 +41,20 @@ Add this to your `claude_desktop_config.json`
 {
   "mcpServers": {
     "robot-desk-pet": {
-      "command": "python",
+      "command": "C:\\Users\\persi\\Desktop\\Jarvis 1.0\\.venv\\Scripts\\python.exe",
       "args": ["C:\\Users\\persi\\Desktop\\Jarvis 1.0\\desktop\\mcp_server.py"]
     }
   }
 }
 ```
 
-Use the same Python that has the project deps (the `mcp` package). If you use a
-venv, point `command` at that interpreter, e.g.
-`C:\\Users\\persi\\Desktop\\Jarvis 1.0\\.venv\\Scripts\\python.exe`.
-Restart Claude Desktop; "robot-desk-pet" appears in the tools menu. Then just ask
-Claude things like *"what's the robot been wondering about?"* and
-*"tell it #3 is a stapler."*
+**`command` must point at a Python that has the project deps** (the `mcp`
+package) — the project `.venv` interpreter above does. Bare `"python"` will fail
+to launch with `ModuleNotFoundError` if your system Python lacks them. (The
+server only needs `mcp` + the queue's stdlib `sqlite3`, not the GPU/model stack,
+so the lightweight `.venv` is enough.) Restart Claude Desktop; "robot-desk-pet"
+appears in the tools menu. Then just ask Claude things like *"what's the robot
+been wondering about?"* and *"tell it #3 is a stapler."*
 
 ### B. HTTP / SSE while the orchestrator is running (live robot)
 
@@ -78,7 +79,15 @@ orchestrator warns at startup if you expose it with the default token.
 
 ## Quick checks
 
+Run these with the `.venv` interpreter (from `desktop/`); they need only `mcp`
++ stdlib, no models:
+
 ```powershell
-python cli_queue.py                       # inspect / resolve / dismiss from the CLI
-python -m pytest tests/test_mcp_server.py # the end-to-end human-in-loop tests
+..\.venv\Scripts\python cli_queue.py list                  # inspect / resolve / dismiss from the CLI
+..\.venv\Scripts\python -m pytest tests\test_mcp_server.py # the in-process human-in-loop tests
+..\.venv\Scripts\python tests\mcp_smoke.py                 # drive the stdio server over the real wire
 ```
+
+`mcp_smoke.py` is the closest check to Claude Desktop without launching it: it
+spawns `mcp_server.py` as a subprocess, seeds a question, then lists / fetches
+(with the inlined frame) / resolves it over the MCP stdio transport.
