@@ -23,6 +23,14 @@ class AudioGate:
         self.active = False
         self._silence = 0
 
+    def reset(self) -> None:
+        """Drop any in-progress burst and pre-roll. Used when the mic is muted
+        (e.g. while the pet is speaking) so the gate restarts cleanly and never
+        carries half of the pet's own voice into the next utterance."""
+        self.active = False
+        self._silence = 0
+        self.preroll.clear()
+
     def feed(self, frame: bytes) -> tuple[str | None, bytes]:
         """Return (event, audio_to_send). event in {None, 'start', 'end'}."""
         speech = self.vad.is_speech(frame, self.sr)

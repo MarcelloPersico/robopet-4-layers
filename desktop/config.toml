@@ -14,25 +14,58 @@ device = "cuda"
 vad_filter = false  # VAD runs on the Pi
 
 [vlm]
+# Vision backend for the see() tool:
+#   "split"   -> a dedicated VLM (model below, Moondream) captions each frame;
+#                the agent LLM reasons over that text. Most debuggable.
+#   "unified" -> NO separate VLM. The agent LLM must itself be multimodal (e.g.
+#                point [agent].model at a Qwen3-VL model in LM Studio): see()
+#                hands it the raw JPEG and it sees pixels directly. Frees the
+#                VLM's ~3GB VRAM and gives sharper, contextual vision, but the
+#                LLM and vision share one model (less separable when debugging).
+mode = "split"
 model = "vikhyatk/moondream2"
 device = "cuda"
 dtype = "float16"
 
 [agent]
-# llama.cpp server is launched as a subprocess by the orchestrator.
+# manage_server = true  -> we launch & own llama-server.exe (default, below).
+# manage_server = false -> connect to an already-running OpenAI-compatible
+#   server that owns the model itself. Point this at LM Studio to pick/swap
+#   models from its UI: in config.local.toml set
+#       [agent]
+#       manage_server = false
+#       port = 1234            # LM Studio's local server port
+#       model = "your-loaded-model-id"   # as shown in LM Studio (or "local")
+#   Then llama_server_exe / model_path / n_gpu_layers below are ignored.
+manage_server = true
+# llama.cpp server is launched as a subprocess by the orchestrator (managed mode).
 llama_server_exe = "C:/tools/llama.cpp/llama-server.exe"
 model_path = "C:/models/qwen2.5-7b-instruct-q4_k_m.gguf"
 host = "127.0.0.1"
 port = 8080
+# Model id sent in the API request. llama.cpp ignores it; LM Studio uses it to
+# select which loaded model answers (set it to the id LM Studio shows).
+model = "local"
 n_gpu_layers = 99
 ctx_size = 8192
 parallel = 1
 temperature = 0.7
+# Stream the reply so spoken sentences start playing before the LLM finishes a
+# long answer (Plan §5.6). Set false to wait for the full reply, then speak.
+stream = true
 
 [tts]
+# backend = "piper"  -> fast CPU subprocess voice (neutral). Default.
+# backend = "kokoro" -> Kokoro-82M neural voice: far more natural, tiny (~0.3GB
+#   on GPU, runs on CPU too). Needs `pip install kokoro` (model auto-downloads).
+backend = "piper"
 piper_exe = "C:/tools/piper/piper.exe"
 voice_model = "C:/models/piper/en_US-amy-medium.onnx"
 workers = 2
+# Kokoro options (used when backend = "kokoro"):
+kokoro_voice = "af_heart"   # e.g. af_heart, af_bella, am_michael, bf_emma (see model card)
+kokoro_lang = "a"           # 'a' American English, 'b' British English
+kokoro_device = "cuda"      # "cuda" or "cpu"
 
 [mcp]
 # stdio: invoked by Claude Desktop via claude_desktop_config.json

@@ -125,10 +125,13 @@ class _NoFrames:
 class LocalMic:
     """Desktop microphone -> VAD-gated bursts -> ASR ingestion. Plan §7.2 logic."""
 
-    def __init__(self, asr, aggressiveness: int = 2, frame_ms: int = 20):
+    def __init__(self, asr, aggressiveness: int = 2, frame_ms: int = 20, speaking=None):
         self.asr = asr
         self.aggressiveness = aggressiveness
         self.frame_ms = frame_ms
+        # Optional half-duplex gate (half_duplex.SpeakingState): while the pet is
+        # talking we discard mic input so its own TTS doesn't loop back into ASR.
+        self._speaking = speaking
         self._stream = None
         self._task: asyncio.Task | None = None
 
@@ -148,11 +151,26 @@ class LocalMic:
 
     async def _loop(self, gate: AudioGate, frame_samples: int) -> None:
         loop = asyncio.get_running_loop()
+        muted = False
         while True:
             data, _overflow = await loop.run_in_executor(None, self._stream.read, frame_samples)
             frame = bytes(data)
             if len(frame) < gate.frame_bytes:
                 continue
+            # Half-duplex: while the pet speaks (and a brief hangover after), drop
+            # mic input so the speaker doesn't feed back into ASR. We keep draining
+            # the stream above (so PortAudio's buffer doesn't overflow) but discard
+            # the frames, and hold the VAD gate reset so listening restarts clean.
+            if self._speaking is not None and self._speaking.is_speaking():
+                if not muted:
+                    if gate.active:  # an utterance was mid-flight; close it out
+                        self.asr.post_vad("end")
+                    gate.reset()
+                    muted = True
+                continue
+            if muted:
+                gate.reset()
+                muted = False
             event, audio = gate.feed(frame)
             if event == "start":
                 self.asr.post_vad("start")

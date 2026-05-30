@@ -13,6 +13,7 @@ so the orchestrator's TTS is driven by tool calls (Plan §5, persona rules).
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from typing import Any
@@ -26,6 +27,76 @@ log = logging.getLogger("agent")
 MAX_TOOL_ITERS = 5
 
 
+class _SpeakArgStreamer:
+    """Pulls the spoken ``text`` out of a *streaming* speak() tool-call argument
+    JSON, so TTS can start before the full tool call arrives.
+
+    The model streams arguments like ``{"text": "Hello. How are you?"}`` in
+    fragments. We re-decode the value on each fragment and return only the newly
+    revealed suffix, stopping cleanly on an incomplete trailing escape.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._valpos: int | None = None  # index where the text value starts
+        self._emitted = 0
+        self._done = False
+
+    def push(self, chunk: str) -> str:
+        self._buf += chunk
+        if self._done:
+            return ""
+        if self._valpos is None:
+            key = self._buf.find('"text"')
+            if key < 0:
+                return ""
+            colon = self._buf.find(":", key + 6)
+            if colon < 0:
+                return ""
+            q = self._buf.find('"', colon + 1)
+            if q < 0:
+                return ""
+            self._valpos = q + 1
+        decoded, end = self._decode(self._buf, self._valpos)
+        if end is not None:
+            self._done = True
+        new = decoded[self._emitted:]
+        self._emitted = len(decoded)
+        return new
+
+    @staticmethod
+    def _decode(s: str, start: int) -> tuple[str, int | None]:
+        """Decode a JSON string body from ``start``. Returns (text_so_far,
+        end_index) where end_index is the closing quote position or None if the
+        value is still open. Stops before an incomplete trailing escape."""
+        out: list[str] = []
+        i, n = start, len(s)
+        while i < n:
+            c = s[i]
+            if c == "\\":
+                if i + 1 >= n:
+                    break  # dangling backslash: wait for more
+                e = s[i + 1]
+                if e == "u":
+                    if i + 6 > n:
+                        break  # incomplete \uXXXX
+                    try:
+                        out.append(chr(int(s[i + 2:i + 6], 16)))
+                    except ValueError:
+                        out.append(" ")
+                    i += 6
+                    continue
+                out.append({"n": "\n", "t": "\t", "r": "\r", '"': '"',
+                            "\\": "\\", "/": "/", "b": " ", "f": " "}.get(e, e))
+                i += 2
+                continue
+            if c == '"':
+                return "".join(out), i
+            out.append(c)
+            i += 1
+        return "".join(out), None
+
+
 class AgentBrain:
     def __init__(
         self,
@@ -36,6 +107,7 @@ class AgentBrain:
         model: str = "local",
         temperature: float = 0.7,
         ctx_turns: int = 6,
+        stream: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.tools = tools
@@ -44,6 +116,10 @@ class AgentBrain:
         self.model = model
         self.temperature = temperature
         self.ctx_turns = ctx_turns
+        # Stream the LLM reply and feed speak() text to TTS sentence-by-sentence
+        # so audio starts before a long answer finishes (Plan §5.6). Requires a
+        # streamable TTS; falls back to the buffered path otherwise.
+        self.stream = stream
         self._client = httpx.AsyncClient(timeout=60.0)
         self._dispatch = {
             "drive": tools.drive,
@@ -85,7 +161,11 @@ class AgentBrain:
         Returns the final assistant text (may be empty if it only used tools)."""
         self.state.add_user_turn(utterance)
         messages = self._build_messages(utterance)
+        if self.stream and getattr(self.tools, "tts_streamable", False):
+            return await self._handle_streaming(messages)
+        return await self._handle_buffered(messages)
 
+    async def _handle_buffered(self, messages: list[dict[str, Any]]) -> str:
         final_text = ""
         for _ in range(MAX_TOOL_ITERS):
             msg = await self._chat(messages)
@@ -102,10 +182,133 @@ class AgentBrain:
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": result}
                 )
 
+            # Unified-vision: if see() captured frames, attach them as an image
+            # message so the multimodal model sees pixels on the next iteration.
+            # No-op in split mode (the VLM already returned a text caption).
+            self._attach_pending_images(messages)
+
         # If the model spoke via plain content instead of the speak() tool, voice it.
         if final_text:
             await self.tools.speak(final_text)
         return final_text
+
+    # --- streaming turn (speak() text reaches TTS as it generates) ------------
+    async def _handle_streaming(self, messages: list[dict[str, Any]]) -> str:
+        final_text = ""
+        spoke_any = False
+        for _ in range(MAX_TOOL_ITERS):
+            msg = await self._chat_stream(messages)  # feeds speak() text to TTS live
+            self.tools.speak_flush()                 # play the trailing sentence
+            tool_calls = msg.get("tool_calls") or []
+            messages.append(
+                {"role": "assistant", "content": msg.get("content"), "tool_calls": tool_calls or None}
+            )
+
+            if not tool_calls:
+                final_text = (msg.get("content") or "").strip()
+                break
+
+            for call in tool_calls:
+                fn = call.get("function", {})
+                if fn.get("name") == "speak":
+                    # Already voiced incrementally during streaming; just record
+                    # the turn + ack the tool call (don't re-synthesize it).
+                    text = self._speak_text(fn.get("arguments"))
+                    if text:
+                        self.state.add_assistant_turn(text)
+                        spoke_any = True
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""), "content": "spoke"}
+                    )
+                else:
+                    result = await self._run_tool(call)
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call.get("id", ""), "content": result}
+                    )
+            self._attach_pending_images(messages)
+
+        # Fallback: model answered in plain content and never called speak().
+        if final_text and not spoke_any:
+            await self.tools.speak(final_text)
+        return final_text
+
+    @staticmethod
+    def _speak_text(raw_args: Any) -> str:
+        try:
+            return (json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})).get("text", "").strip()
+        except (json.JSONDecodeError, AttributeError):
+            return ""
+
+    async def _chat_stream(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Stream a completion; feed any speak() text to TTS as it arrives.
+        Returns the fully assembled assistant message (content + tool_calls)."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": AGENT_TOOL_SPECS,
+            "tool_choice": "auto",
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        content_parts: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        speakers: dict[int, _SpeakArgStreamer] = {}
+
+        async with self._client.stream(
+            "POST", f"{self.base_url}/v1/chat/completions", json=payload
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    choice = json.loads(data)["choices"][0]
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = calls.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+                        if slot["name"] == "speak":
+                            inc = speakers.setdefault(idx, _SpeakArgStreamer()).push(fn["arguments"])
+                            if inc:
+                                self.tools.speak_feed(inc)  # → TTS, plays per sentence
+
+        tool_calls = [
+            {"id": s["id"], "type": "function",
+             "function": {"name": s["name"], "arguments": s["args"]}}
+            for s in calls.values() if s["name"]
+        ]
+        return {"role": "assistant",
+                "content": "".join(content_parts) or None,
+                "tool_calls": tool_calls or None}
+
+    def _attach_pending_images(self, messages: list[dict[str, Any]]) -> None:
+        take = getattr(self.tools, "take_pending_images", None)
+        if take is None:
+            return
+        for frame in take():
+            b64 = base64.b64encode(frame).decode("ascii")
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here is your current camera view:"},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            })
 
     async def _run_tool(self, call: dict[str, Any]) -> str:
         fn_name = call.get("function", {}).get("name", "")

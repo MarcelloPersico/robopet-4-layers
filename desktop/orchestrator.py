@@ -26,7 +26,7 @@ from notifier import Notifier
 from pet_queue import QueueDB
 from state import WorldState
 from tools import RobotTools
-from tts import TTS
+from tts import build_tts
 from vlm import VLM
 from wsserver import WsServer
 
@@ -48,35 +48,53 @@ class Orchestrator:
         self.ws = WsServer(ws["host"], ws["port"], ws["ping_interval_s"], ws["ping_timeout_s"])
         self.motion = Motion(self.ws)
 
-        self.asr = ASR(cfg["asr"]["model"], cfg["asr"]["device"], cfg["asr"]["compute_type"])
+        self.asr = ASR(cfg["asr"]["model"], cfg["asr"]["device"], cfg["asr"]["compute_type"],
+                       vad_filter=cfg["asr"].get("vad_filter", False))
+        self.vision_mode = cfg["vlm"].get("mode", "split")
         self.vlm = VLM(cfg["vlm"]["model"], cfg["vlm"]["device"], cfg["vlm"]["dtype"])
-        self.tts = TTS(cfg["tts"]["piper_exe"], cfg["tts"]["voice_model"], cfg["tts"].get("workers", 2))
+        self.tts = build_tts(cfg["tts"])
         self.notifier = Notifier(
             cfg["notifier"]["backend"], cfg["notifier"]["throttle_seconds"], cfg["notifier"].get("webhook_url", "")
         )
-        self.tools = RobotTools(self.motion, self.vlm, self.tts, self.queue, self.state, self.ws, self.notifier)
+        self.tools = RobotTools(self.motion, self.vlm, self.tts, self.queue, self.state, self.ws,
+                                self.notifier, vision_mode=self.vision_mode)
 
         persona = (_HERE / cfg["paths"]["persona"]).read_text(encoding="utf-8")
         a = cfg["agent"]
         self.agent = AgentBrain(
             base_url=f"http://{a['host']}:{a['port']}",
             tools=self.tools, state=self.state, persona_text=persona,
+            model=a.get("model", "local"),
             temperature=a.get("temperature", 0.7),
+            stream=a.get("stream", True),
         )
         self._llama_proc: asyncio.subprocess.Process | None = None
         self._busy = asyncio.Lock()  # serialize agent turns / guard idle vs speech
 
-    # --- llama.cpp subprocess -------------------------------------------------
+    # --- LLM server -----------------------------------------------------------
     async def _launch_llama(self) -> None:
         a = self.cfg["agent"]
-        self._llama_proc = await llama_server.launch(a)
+        # Managed mode: spawn & own llama-server. External mode
+        # (manage_server=false, e.g. LM Studio): just connect to it.
+        if llama_server.manages(a):
+            self._llama_proc = await llama_server.launch(a)
+        else:
+            self._llama_proc = None
+            log.info("using external LLM server at %s:%s (not launching one)",
+                     a["host"], a["port"])
         await llama_server.wait_ready(f"http://{a['host']}:{a['port']}")
 
     # --- lifecycle ------------------------------------------------------------
     async def run(self) -> None:
         await self.ws.start()
         log.info("loading models...")
-        await asyncio.gather(self.asr.load(), self.vlm.load())
+        # In unified-vision mode the agent LLM sees frames itself, so skip Moondream.
+        if self.vision_mode == "unified":
+            log.info("vision: unified mode — agent LLM sees frames (no separate VLM)")
+            await self.asr.load()
+        else:
+            await asyncio.gather(self.asr.load(), self.vlm.load())
+        await self.tts.load()  # pre-warm (no-op for Piper; loads Kokoro's model)
         await self._launch_llama()
 
         # Push drivetrain config + initial idle intensity to the Teensy.

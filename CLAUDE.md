@@ -99,8 +99,10 @@ plan's 2 Hz; see review note below.)
 | `wsserver.py` | Pi WS server; framing + channel demux; multi-connection (bridge + capture) | §3.2, §8 |
 | `asr.py` | faster-whisper; streaming partial+final transcripts | §4 |
 | `vlm.py` | Moondream2 `describe(jpeg_bytes) -> str` | §4 |
-| `agent.py` | **Agent brain**: llama.cpp client, tool-call loop, prompt builder | §5 |
-| `tts.py` | Piper subprocess pool; sentence-streaming to local speaker | §4, §8 |
+| `agent.py` | **Agent brain**: OpenAI-compatible client, tool-call loop, prompt builder; **streaming** (feeds `speak()` text to TTS as it generates) | §5 |
+| `llama_server.py` | Launch/readiness for the LLM server; `manages()` picks **managed** (we spawn llama.cpp) vs **external** (connect to a running server, e.g. LM Studio) | §5, §8.1 |
+| `tts.py` | Sentence-streaming TTS; pluggable backends via `build_tts()`: **`TTS`** (Piper, CPU, default) / **`KokoroTTS`** (Kokoro-82M neural). `BaseTTS` holds the shared player loop + half-duplex gate + echo hook | §4, §8 |
+| `half_duplex.py` | `SpeakingState` — mutes the mic while the pet speaks (+ hangover) so the speaker doesn't feed back into ASR in the single-box `local_loop` | §8.7 |
 | `motion.py` | Motion intents → Teensy JSON cmds (via WS UART channel) | §3.1 |
 | `mcp_server.py` | In-process MCP server: robot + queue tools (stdio + HTTP/SSE) | §3.3 |
 | `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. **Named `pet_queue`, not the plan's `queue`** — a module called `queue.py` shadows the stdlib `queue` that `concurrent.futures` imports for every `run_in_executor`, crashing the orchestrator. | §8.4 |
@@ -123,6 +125,40 @@ telemetry one-liner, new utterance).
 holds: low object-identity confidence, reasoning beyond ~3 steps, opinion/
 judgment beyond competence, or genuine novelty (would be a guess). Otherwise
 answer locally. *Do not queue trivial questions.*
+
+### Runtime switches (set in gitignored `config.local.toml`)
+The committed `config.toml` holds **portable defaults**; per-machine choices go
+in `config.local.toml` (deep-merged over it). The pluggable seams added since the
+original scaffold:
+
+- **`[agent] manage_server`** — `true` (default) launches & owns `llama-server.exe`;
+  `false` connects to an already-running OpenAI-compatible server. Set `false` +
+  `port`/`model` to drive the pet from **LM Studio** (pick/swap models in its UI).
+  `wait_ready` probes `/health` (llama.cpp) and `/v1/models` (LM Studio).
+- **`[agent] stream`** — `true` (default) streams the reply and feeds the
+  `speak()` text to TTS sentence-by-sentence (audio starts before a long answer
+  finishes). Only the `speak()` channel is voiced — a reasoning model's private
+  `content` is never spoken. Falls back to buffered if the TTS isn't streamable.
+- **`[agent] model`** — id sent in the request; llama.cpp ignores it, LM Studio
+  uses it to select the loaded model.
+- **`[vlm] mode`** — `split` (default): Moondream captions frames for `see()`,
+  most debuggable. `unified`: **no separate VLM** — the agent LLM must itself be
+  multimodal (e.g. a Qwen3-VL/Gemma vision model in LM Studio); `see()` injects
+  the raw JPEG as an `image_url` message (`agent.py:_attach_pending_images`) and
+  the LLM sees pixels. Frees the VLM's ~3 GB but couples seeing + reasoning.
+- **`[tts] backend`** — `piper` (default, CPU) or `kokoro` (Kokoro-82M neural,
+  far more natural; `kokoro_voice`/`kokoro_device`). `build_tts()` selects it.
+- **`[asr] vad_filter`** — `false` by default; `true` adds faster-whisper's
+  Silero VAD on the final pass. ASR also has **always-on anti-hallucination**:
+  an RMS energy gate + per-segment `no_speech_prob`/`avg_logprob` filtering +
+  `condition_on_previous_text=False`, temperature 0, and a bare-phrase blocklist
+  (kills the "Thank you."/"you" phantoms Whisper emits on silence).
+
+**This machine's live config (2026-05-30):** LM Studio serving **Gemma-4-26B-A4B**
+(multimodal MoE, 4 B active) on `:1234` (`manage_server=false`), `mode="unified"`
+(Gemma sees frames itself), `stream=true`, `backend="kokoro"` (CPU). Gemma at Q4
+(~14–15 GB) spills experts to RAM — tolerable for an A4B MoE. Tool-calling +
+vision verified working through LM Studio.
 
 ### Deferred-question pattern (§5, §8.4) — this is the cloud replacement
 `queue_question` → SQLite row + saved camera frame + pose/excerpt snapshot →
@@ -180,6 +216,13 @@ works end-to-end** — the USB webcam (index 0) → Moondream on the GPU at
 ~0.6 s/image (torch **2.12.0+cu132**, CUDA 13.2, `sm_120`). All three modes
 (text / voice / vision) are verified, all on the GPU.
 
+**Update (2026-05-30):** now also verified with the **LM Studio + Gemma-4-26B-A4B**
+brain (`manage_server=false`, `mode="unified"` so Gemma sees frames itself),
+**streaming TTS**, **Kokoro** neural voice (installed in the runtime Python; CPU),
+and **half-duplex** mic gating (no self-hearing). See "Runtime switches" above.
+`local_loop.py` flags: `--mic-hangover` (half-duplex tail), `--asr-device`,
+`--vlm-device`.
+
 **GPU ASR:** Whisper runs on the GPU (~0.14 s/utterance, RTF 0.03 — vs ~3.7 s on
 CPU). ctranslate2's CUDA-12 build needs `cublas64_12.dll` + cuDNN 9, supplied by
 the `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip packages (in `pyproject.toml`);
@@ -196,6 +239,9 @@ External binaries/models (paths in `config.toml`; override in gitignored
 - `C:/tools/llama.cpp/llama-server.exe` (Vulkan) + `C:/tools/llama.cpp-cuda/` (CUDA 13.3) + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
 - `C:/tools/piper/piper.exe` + `C:/models/piper/en_US-amy-medium.onnx`
 - ASR `large-v3-turbo`, VLM `vikhyatk/moondream2` (auto-downloaded)
+- **Kokoro-82M** (`pip install kokoro` → `misaki` G2P + `espeakng-loader` +
+  spaCy `en_core_web_sm`, all in the runtime Python; model auto-downloads from
+  `hexgrad/Kokoro-82M`). **LM Studio** runs `google/gemma-4-26b-a4b` on `:1234`.
 
 **VRAM budget (§4):** ASR ~1.6 GB + VLM ~3.0 GB + Qwen2.5-7B ~5.5 GB + ~1.5 GB
 KV ≈ **11.6 GB resident of 16 GB** (~4 GB margin). Piper is CPU-only.
@@ -221,8 +267,11 @@ to lint and test without the GPU/hardware stack (heavy libs are lazy-imported):
 python -m venv .venv
 .\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
 .\.venv\Scripts\ruff check desktop pi      # clean
-.\.venv\Scripts\python -m pytest desktop   # 32 tests: protocol, queue, state, config,
-                                           #   tts splitter, tools, agent loop, ws loopback
+.\.venv\Scripts\python -m pytest desktop   # 57 tests: protocol, queue, state, config,
+                                           #   tts (splitter + Kokoro + backend factory),
+                                           #   tools (+ unified vision), agent loop (+ streaming
+                                           #   + image inject), asr anti-hallucination,
+                                           #   half-duplex gate, ws loopback
 .\.venv\Scripts\python -m pytest pi        # 6 tests: protocol, VAD audio-gate
 ```
 Tests cover the hardware-/model-free logic. The Teensy firmware needs PlatformIO

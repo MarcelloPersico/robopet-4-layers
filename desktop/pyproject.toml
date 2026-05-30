@@ -17,6 +17,8 @@ dependencies = [
     "mcp>=1.0",
     "win10toast-click>=0.1.2; sys_platform == 'win32'",
     "tomli>=2; python_version < '3.11'",
+    # Optional neural TTS backend ([tts] backend = "kokoro"); lazy-imported.
+    "kokoro>=0.9",
     # GPU ASR: ctranslate2's CUDA-12 build needs these runtime libs (cublas64_12,
     # cuDNN 9). asr.py registers their DLL dirs when device='cuda' on Windows.
     "nvidia-cublas-cu12; sys_platform == 'win32'",

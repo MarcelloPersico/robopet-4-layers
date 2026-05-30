@@ -107,3 +107,22 @@ async def test_speak_records_turn(kit):
     await tools.speak("hello")
     assert tts.said == ["hello"]
     assert state.conversation[-1] == ("assistant", "hello")
+
+
+async def test_unified_see_stashes_frame_not_caption(tmp_path):
+    state = WorldState()
+    frames = FakeFrames(b"\xff\xd8jpeg")
+    tools = RobotTools(FakeMotion(), FakeVLM(), FakeTTS(), None, state, frames,
+                       FakeNotifier(), vision_mode="unified")
+    out = await tools.see()
+    # In unified mode see() does NOT caption via the VLM; it stashes the frame.
+    assert "attached" in out.lower()
+    assert tools.take_pending_images() == [b"\xff\xd8jpeg"]
+    # draining a second time yields nothing
+    assert tools.take_pending_images() == []
+
+
+async def test_split_see_has_no_pending_images(kit):
+    tools, *_ = kit
+    await tools.see()
+    assert tools.take_pending_images() == []  # split mode never stashes frames

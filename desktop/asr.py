@@ -48,6 +48,19 @@ def _add_cuda_dll_dirs() -> None:
 PARTIAL_INTERVAL_S = 0.7
 MIN_PARTIAL_SAMPLES = protocol.AUDIO_SAMPLE_RATE // 2  # 0.5 s
 
+# --- anti-hallucination thresholds ------------------------------------------
+# Whisper invents canned phrases ("Thank you.", "you") when fed silence/noise.
+# We guard three ways: a cheap energy gate before the model, and two
+# per-segment confidence filters after it (faster-whisper exposes both).
+SILENCE_RMS = 0.006        # clips below this RMS (normalized) are treated as silence
+MAX_NO_SPEECH_PROB = 0.6   # drop segments Whisper itself flags as non-speech
+MIN_AVG_LOGPROB = -1.0     # drop very low-confidence (usually hallucinated) text
+# Common bare hallucinations on silence; dropped if they're the whole transcript.
+_HALLUCINATIONS = {
+    "you", "thank you.", "thank you", "thanks for watching!", "thanks for watching.",
+    "bye.", ".", "so", "the", "i'm sorry.",
+}
+
 
 @dataclass
 class _Event:
@@ -56,10 +69,14 @@ class _Event:
 
 
 class ASR:
-    def __init__(self, model: str, device: str = "cuda", compute_type: str = "int8_float16"):
+    def __init__(self, model: str, device: str = "cuda", compute_type: str = "int8_float16",
+                 vad_filter: bool = False):
         self._model_name = model
         self._device = device
         self._compute_type = compute_type
+        # faster-whisper's own (Silero) VAD trims non-speech inside the final
+        # clip — a strong extra hallucination guard for local desktop capture.
+        self._vad_filter = vad_filter
         self._model = None
         self.events: asyncio.Queue[_Event] = asyncio.Queue(maxsize=400)
 
@@ -132,16 +149,44 @@ class ASR:
                         await on_final(text)
                 buf.clear()
 
+    @staticmethod
+    def _too_quiet(audio: "np.ndarray") -> bool:
+        if audio.size == 0:
+            return True
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+        return rms < SILENCE_RMS
+
     async def _transcribe(self, pcm: bytes, partial: bool) -> str:
         if self._model is None:
             return ""
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        # Energy gate: skip the model entirely on near-silent clips (VAD false
+        # triggers on mic hiss) — the cheapest way to avoid a hallucinated reply.
+        if self._too_quiet(audio):
+            return ""
         loop = asyncio.get_running_loop()
         return (await loop.run_in_executor(None, self._run_model, audio, partial)).strip()
 
     def _run_model(self, audio: "np.ndarray", partial: bool) -> str:
         beam = 1 if partial else 5
         segments, _info = self._model.transcribe(
-            audio, language="en", beam_size=beam, vad_filter=False
+            audio, language="en", beam_size=beam,
+            # Silero VAD trims internal non-speech on the final pass (not partials,
+            # to keep them cheap). condition_on_previous_text=False + temperature 0
+            # stop the model seeding/inventing text on weak audio.
+            vad_filter=self._vad_filter and not partial,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            no_speech_threshold=MAX_NO_SPEECH_PROB,
+            log_prob_threshold=MIN_AVG_LOGPROB,
         )
-        return " ".join(seg.text for seg in segments)
+        kept = [
+            seg.text for seg in segments
+            if getattr(seg, "no_speech_prob", 0.0) < MAX_NO_SPEECH_PROB
+            and getattr(seg, "avg_logprob", 0.0) > MIN_AVG_LOGPROB
+        ]
+        text = " ".join(kept).strip()
+        # Drop a transcript that is *only* a known silence-hallucination phrase.
+        if text.lower() in _HALLUCINATIONS:
+            return ""
+        return text

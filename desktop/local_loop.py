@@ -24,12 +24,13 @@ from pathlib import Path
 import llama_server
 from agent import AgentBrain
 from config import load_config
+from half_duplex import SpeakingState
 from local_io import LocalCamera, LocalMic, NullMotion, _NoFrames
 from notifier import Notifier
 from pet_queue import QueueDB
 from state import WorldState
 from tools import RobotTools
-from tts import TTS
+from tts import build_tts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("local_loop")
@@ -44,14 +45,6 @@ class ConsoleTTS:
 
     async def run(self) -> None:  # nothing to play
         await asyncio.Event().wait()
-
-
-class PrintingTTS(TTS):
-    """Real Piper TTS that also prints what the pet says."""
-
-    async def say(self, text: str) -> None:
-        print(f"  🗣  {text}")
-        await super().say(text)
 
 
 class _StubVLM:
@@ -75,33 +68,52 @@ async def amain(args: argparse.Namespace) -> None:
     notifier = Notifier(cfg["notifier"]["backend"], cfg["notifier"]["throttle_seconds"],
                         cfg["notifier"].get("webhook_url", ""))
 
-    tts = ConsoleTTS() if args.no_tts else PrintingTTS(
-        cfg["tts"]["piper_exe"], cfg["tts"]["voice_model"], cfg["tts"].get("workers", 2)
-    )
+    # Half-duplex gate: only meaningful when we actually drive a speaker (real
+    # TTS) and listen on the same box (--voice). It mutes the mic while the pet
+    # talks so its own voice doesn't feed back into ASR.
+    speaking = SpeakingState(hangover_s=args.mic_hangover) if (args.voice and not args.no_tts) else None
 
+    tts = ConsoleTTS() if args.no_tts else build_tts(cfg["tts"], speaking=speaking, echo=True)
+
+    vision_mode = cfg.get("vlm", {}).get("mode", "split")
     if args.vision:
-        from vlm import VLM
-        vlm = VLM(cfg["vlm"]["model"], args.vlm_device, cfg["vlm"]["dtype"])
-        await vlm.load()
         camera = LocalCamera(cfg.get("camera", {}).get("device_index", 0))
         await camera.start()
         frames = camera
+        if vision_mode == "unified":
+            # The agent LLM does the seeing (must be a multimodal model); no Moondream.
+            vlm = _StubVLM()
+            log.info("vision: unified mode — the agent LLM sees frames (no separate VLM)")
+        else:
+            from vlm import VLM
+            vlm = VLM(cfg["vlm"]["model"], args.vlm_device, cfg["vlm"]["dtype"])
+            await vlm.load()
     else:
         vlm, frames, camera = _StubVLM(), _NoFrames(), None
+        vision_mode = "split"  # nothing to attach without a camera
 
-    tools = RobotTools(motion, vlm, tts, queue, state, frames, notifier)
+    tools = RobotTools(motion, vlm, tts, queue, state, frames, notifier, vision_mode=vision_mode)
     persona = (_HERE / cfg["paths"]["persona"]).read_text(encoding="utf-8")
     agent = AgentBrain(
         base_url=f"http://{cfg['agent']['host']}:{cfg['agent']['port']}",
         tools=tools, state=state, persona_text=persona,
+        model=cfg["agent"].get("model", "local"),
         temperature=cfg["agent"].get("temperature", 0.7),
+        stream=cfg["agent"].get("stream", True),
     )
 
-    proc = await llama_server.launch(cfg["agent"])
+    # Managed mode: we launch llama-server. External mode (manage_server=false,
+    # e.g. LM Studio): the server is already running — just connect to it.
+    managed = llama_server.manages(cfg["agent"])
+    proc = await llama_server.launch(cfg["agent"]) if managed else None
+    if not managed:
+        log.info("using external LLM server at %s:%s (not launching one)",
+                 cfg["agent"]["host"], cfg["agent"]["port"])
     tasks: list[asyncio.Task] = []
     try:
         await llama_server.wait_ready(f"http://{cfg['agent']['host']}:{cfg['agent']['port']}")
         if not args.no_tts:
+            await tts.load()  # pre-warm (no-op for Piper; loads Kokoro's model)
             tasks.append(asyncio.create_task(tts.run()))
 
         async def handle(text: str) -> None:
@@ -114,9 +126,10 @@ async def amain(args: argparse.Namespace) -> None:
             from asr import ASR
             device = args.asr_device
             compute = "int8" if device == "cpu" else cfg["asr"]["compute_type"]
-            asr = ASR(cfg["asr"]["model"], device, compute)
+            asr = ASR(cfg["asr"]["model"], device, compute,
+                      vad_filter=cfg["asr"].get("vad_filter", False))
             await asr.load()
-            mic = LocalMic(asr, cfg.get("audio", {}).get("vad_aggressiveness", 2))
+            mic = LocalMic(asr, cfg.get("audio", {}).get("vad_aggressiveness", 2), speaking=speaking)
             await mic.start()
             print("🎙  listening — speak into your mic (Ctrl+C to quit)\n")
             await asr.run(on_final=handle)
@@ -128,7 +141,7 @@ async def amain(args: argparse.Namespace) -> None:
         if camera:
             await camera.stop()
         await agent.aclose()
-        if proc.returncode is None:
+        if proc is not None and proc.returncode is None:  # only if we launched it
             proc.terminate()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -172,6 +185,9 @@ def main() -> None:
                    help="Whisper device (default cuda; ~0.14s/utterance on the 5070 Ti)")
     p.add_argument("--vlm-device", default="cuda", choices=["cpu", "cuda"],
                    help="Moondream device (default cuda; verified ~0.6s/image on the 5070 Ti)")
+    p.add_argument("--mic-hangover", type=float, default=0.6,
+                   help="seconds to keep the mic muted after the pet stops talking, so the "
+                        "speaker's tail doesn't feed back into ASR (half-duplex; --voice only)")
     args = p.parse_args()
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(amain(args))

@@ -120,7 +120,8 @@ AGENT_TOOL_SPECS: list[dict[str, Any]] = [
 
 
 class RobotTools:
-    def __init__(self, motion, vlm, tts, queue, state, frame_source: FrameSource, notifier):
+    def __init__(self, motion, vlm, tts, queue, state, frame_source: FrameSource, notifier,
+                 vision_mode: str = "split"):
         self.motion = motion
         self.vlm = vlm
         self.tts = tts
@@ -128,6 +129,13 @@ class RobotTools:
         self.state = state
         self.frames = frame_source
         self.notifier = notifier
+        # "split"   -> see() captions the frame with the dedicated VLM (Moondream).
+        # "unified" -> the agent LLM is itself multimodal; see() stashes the raw
+        #              frame and agent.py injects it as an image so the model sees
+        #              pixels directly (no separate VLM). See half a dozen lines in
+        #              see() + AgentBrain._maybe_attach_images.
+        self.vision_mode = vision_mode
+        self._pending_images: list[bytes] = []
 
     async def _exec(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
@@ -149,14 +157,45 @@ class RobotTools:
         frame = self.frames.take_latest_frame()
         if not frame:
             return "(no camera frame available)"
+        if self.vision_mode == "unified":
+            # Hand the raw frame to the multimodal agent LLM instead of captioning.
+            # agent.py drains _pending_images and injects them as an image message,
+            # so the model sees actual pixels on its next step.
+            self._pending_images.append(frame)
+            self.state.set_vision("(looking at the live camera now)")
+            return "Looking now — the current camera frame is attached below."
         desc = await self.vlm.describe(frame)
         self.state.set_vision(desc)
         return desc
+
+    def take_pending_images(self) -> list[bytes]:
+        """Drain frames captured by see() in unified mode (agent.py injects them
+        as image messages). Always empty in split mode."""
+        imgs = self._pending_images
+        self._pending_images = []
+        return imgs
 
     async def speak(self, text: str) -> str:
         await self.tts.say(text)
         self.state.add_assistant_turn(text)
         return "spoke"
+
+    # --- streaming speech (agent.py feeds the speak() text as Gemma generates) -
+    @property
+    def tts_streamable(self) -> bool:
+        """True if the TTS can accept incremental text (feed/flush) so spoken
+        sentences start playing before the LLM finishes the full reply."""
+        return callable(getattr(self.tts, "feed", None)) and callable(getattr(self.tts, "flush", None))
+
+    def speak_feed(self, chunk: str) -> None:
+        fn = getattr(self.tts, "feed", None)
+        if fn:
+            fn(chunk)  # enqueues + plays each sentence as it completes
+
+    def speak_flush(self) -> None:
+        fn = getattr(self.tts, "flush", None)
+        if fn:
+            fn()  # play any trailing partial sentence at end of a reply
 
     async def set_idle_intensity(self, level: float) -> str:
         await self.motion.set_idle_intensity(level)
