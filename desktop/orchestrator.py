@@ -87,6 +87,14 @@ class Orchestrator:
     # --- lifecycle ------------------------------------------------------------
     async def run(self) -> None:
         await self.ws.start()
+        # Seed the recent-answers buffer from resolutions the human shared back
+        # while the robot was off (e.g. triaged via Claude Desktop over MCP, which
+        # only persists to resolved_knowledge). Without this, the robot re-asks
+        # questions a human already answered. Plan §5.5, §8.4.
+        seeded = self.queue.load_recent_resolutions(self.state.recent_answers.maxlen or 50)
+        self.state.load_resolutions(seeded)
+        if seeded:
+            log.info("seeded %d resolved answer(s) from the queue", len(seeded))
         log.info("loading models...")
         # In unified-vision mode the agent LLM sees frames itself, so skip Moondream.
         if self.vision_mode == "unified":
@@ -193,6 +201,14 @@ class Orchestrator:
         m = self.cfg["mcp"]
         if not m.get("enable_http", True):
             return
+        host = m["http_host"]
+        # The HTTP surface can drive motors and read the camera (Plan §3.3,
+        # review note #3). It's localhost-only by default; warn loudly if it's
+        # exposed to the LAN while the bearer token is still the placeholder.
+        if host not in ("127.0.0.1", "localhost", "::1") and \
+                m.get("http_bearer_token", "").startswith("change-me"):
+            log.warning("MCP HTTP bound to %s with the DEFAULT bearer token — "
+                        "set [mcp].http_bearer_token in config.local.toml", host)
         with contextlib.suppress(asyncio.CancelledError):
             await mcp_server.serve_http(self.tools, m["http_host"], m["http_port"])
 
