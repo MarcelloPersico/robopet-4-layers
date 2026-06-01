@@ -54,7 +54,11 @@ if [[ ! -d "$PET_HOME/venv" ]]; then
   sudo -u "$PET_USER" python3 -m venv "$PET_HOME/venv"
 fi
 sudo -u "$PET_USER" "$PET_HOME/venv/bin/pip" install --upgrade pip
+# NOTE: webrtcvad imports pkg_resources, which setuptools>=81 removed (and
+# Python 3.13 venvs no longer ship setuptools by default). Pin setuptools<81 so
+# pkg_resources is present. Seen on Raspberry Pi OS trixie / Python 3.13.
 sudo -u "$PET_USER" "$PET_HOME/venv/bin/pip" install \
+  "setuptools<81" \
   "websockets>=13" "pyserial-asyncio>=0.6" "opencv-python-headless>=4.10" \
   "sounddevice>=0.5" "webrtcvad>=2.0.10" "numpy>=1.26"
 

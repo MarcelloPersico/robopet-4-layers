@@ -7,7 +7,13 @@ Guidance for Claude Code working in this repository.
 >   end-to-end (text / voice / vision). 84 tests pass (`desktop/tests`) — incl.
 >   the dual-OLED "eyes" face path (`test_face.py`).
 > - **`pi/`** — implemented (`bridge.py`, `capture.py`, `wsclient.py`,
->   `protocol.py`, `setup.sh`; 6 tests).
+>   `protocol.py`, `setup.sh`; 6 tests). **Bench-verified on hardware 2026-06-01**:
+>   provisioned a Pi Zero 2 W (Raspberry Pi OS Lite / Debian 13 trixie / py3.13),
+>   `setup.sh` brings up the venv + UART fix (`serial0`→PL011 `ttyAMA0`) + systemd;
+>   **M3** (UART↔WS bridge) + **M4** (motion-gated JPEG + VAD PCM) both stream to the
+>   desktop over WS — verified all four channels (control/audio/video/uart). One
+>   trixie/py3.13 fix in `setup.sh`: pin `setuptools<81` so `webrtcvad`'s
+>   `pkg_resources` import works.
 > - **`teensy/`** — firmware implemented (`main.cpp` + MotorDriver, EncoderReader,
 >   PID, MotionPlanner, AnimationPlayer, ReflexEngine, CommandParser, Telemetry,
 >   Watchdog **+ the dual-OLED face subsystem: EmotionLibrary / EyeRenderer /
