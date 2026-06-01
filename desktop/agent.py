@@ -20,11 +20,32 @@ from typing import Any
 
 import httpx
 
+from observatory import emit, get_observatory
 from tools import AGENT_TOOL_SPECS, RobotTools
 
 log = logging.getLogger("agent")
 
 MAX_TOOL_ITERS = 5
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """The most recent user message as plain text, with any image_url blocks
+    stripped (REDACTED — never put base64 frame bytes on the dashboard). Used
+    only to build the Observatory chat-request detail (Plan §11)."""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content[:200]
+        if isinstance(content, list):  # multimodal: keep text parts, drop images
+            text = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+            return (text + " [+image]")[:200]
+        return ""
+    return ""
 
 
 class _SpeakArgStreamer:
@@ -272,6 +293,13 @@ class AgentBrain:
             "temperature": self.temperature,
             "stream": True,
         }
+        # Observatory tap (Plan §11): the brain's RECEIVING view. Redacted — only
+        # message/tool counts + the last user text (no image bytes). No-op when off.
+        if get_observatory().enabled:
+            user = _last_user_text(messages)
+            emit("lmstudio", "recv", "chat-request",
+                 f"{len(messages)} msgs, {len(AGENT_TOOL_SPECS)} tools: {user[:60]}",
+                 {"messages": len(messages), "tools": len(AGENT_TOOL_SPECS), "user": user})
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         speakers: dict[int, _SpeakArgStreamer] = {}
@@ -307,14 +335,24 @@ class AgentBrain:
                             inc = speakers.setdefault(idx, _SpeakArgStreamer()).push(fn["arguments"])
                             if inc:
                                 self.tools.speak_feed(inc)  # → TTS, plays per sentence
+                                # Observatory tap (Plan §11): the streamed speak()
+                                # feed bypasses _run_tool, so catch it here.
+                                emit("lmstudio", "exec", "speak-feed", inc[:80], {"text": inc})
 
         tool_calls = [
             {"id": s["id"], "type": "function",
              "function": {"name": s["name"], "arguments": s["args"]}}
             for s in calls.values() if s["name"]
         ]
+        content = "".join(content_parts)
+        # Observatory tap (Plan §11): the brain's SENDING view (content size +
+        # tool-call names). No-op when the dashboard is disabled.
+        names = [tc["function"]["name"] for tc in tool_calls]
+        emit("lmstudio", "send", "chat-response",
+             f"{len(content)} chars, tools: {names or '-'}",
+             {"chars": len(content), "tool_calls": names})
         return {"role": "assistant",
-                "content": "".join(content_parts) or None,
+                "content": content or None,
                 "tool_calls": tool_calls or None}
 
     def _attach_pending_images(self, messages: list[dict[str, Any]]) -> None:
@@ -342,14 +380,21 @@ class AgentBrain:
         handler = self._dispatch.get(fn_name)
         if handler is None:
             return f"error: unknown tool {fn_name}"
+        # Observatory tap (Plan §11): the agent-originated tool path (kept distinct
+        # from the MCP-originated one in mcp_server.py). All no-op when off.
+        emit("lmstudio", "exec", "tool:" + fn_name, f"{fn_name}(...)", args)
         try:
             result = await handler(**args)
         except TypeError as e:
+            emit("lmstudio", "exec", "tool-error", f"{fn_name}: {e}", {"error": str(e)})
             return f"error: bad arguments for {fn_name}: {e}"
         except Exception as e:  # noqa: BLE001 - surface tool errors to the model, don't crash
             log.warning("tool %s failed: %s", fn_name, e)
+            emit("lmstudio", "exec", "tool-error", f"{fn_name}: {e}", {"error": str(e)})
             return f"error: {fn_name} failed: {e}"
-        return result if isinstance(result, str) else json.dumps(result, default=str)
+        out = result if isinstance(result, str) else json.dumps(result, default=str)
+        emit("lmstudio", "exec", "tool-result", out[:80], {"result": out})
+        return out
 
     async def _chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         payload = {
@@ -360,7 +405,22 @@ class AgentBrain:
             "temperature": self.temperature,
             "stream": False,
         }
+        # Observatory tap (Plan §11): brain's RECEIVING view (redacted). No-op when off.
+        if get_observatory().enabled:
+            user = _last_user_text(messages)
+            emit("lmstudio", "recv", "chat-request",
+                 f"{len(messages)} msgs, {len(AGENT_TOOL_SPECS)} tools: {user[:60]}",
+                 {"messages": len(messages), "tools": len(AGENT_TOOL_SPECS), "user": user})
         resp = await self._client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]
+        msg = data["choices"][0]["message"]
+        # Observatory tap (Plan §11): brain's SENDING view.
+        if get_observatory().enabled:
+            names = [tc.get("function", {}).get("name", "")
+                     for tc in (msg.get("tool_calls") or [])]
+            content = msg.get("content") or ""
+            emit("lmstudio", "send", "chat-response",
+                 f"{len(content)} chars, tools: {names or '-'}",
+                 {"chars": len(content), "tool_calls": names})
+        return msg

@@ -31,6 +31,7 @@ from vlm import VLM
 from wsserver import WsServer
 
 import mcp_server
+import observatory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestrator")
@@ -119,6 +120,7 @@ class Orchestrator:
             asyncio.create_task(self._idle_loop(), name="idle"),
             asyncio.create_task(self._health_loop(), name="health"),
             asyncio.create_task(self._serve_mcp(), name="mcp"),
+            asyncio.create_task(self._serve_dashboard(), name="dashboard"),
         ]
         log.info("orchestrator running (%d tasks)", len(tasks))
         try:
@@ -160,6 +162,12 @@ class Orchestrator:
                 continue
             if obj.get("type") == "telemetry":
                 self.state.set_telemetry(obj)
+            else:
+                # Observatory tap (Plan §11): surface the event/log/pong lines the
+                # firmware sends up that aren't telemetry (telemetry has its own
+                # tap in state.set_telemetry). No-op when the dashboard is off.
+                observatory.emit("teensy", "send", obj.get("type", "event"),
+                                 str(obj.get("msg") or obj.get("type") or obj)[:120], obj)
 
     async def _on_utterance(self, text: str) -> None:
         log.info("user: %s", text)
@@ -222,6 +230,26 @@ class Orchestrator:
                         "set [mcp].http_bearer_token in config.local.toml", host)
         with contextlib.suppress(asyncio.CancelledError):
             await mcp_server.serve_http(self.tools, m["http_host"], m["http_port"])
+
+    async def _serve_dashboard(self) -> None:
+        """Read-only "Observatory" dashboard (Plan §11). Off by default: returns
+        before importing/binding anything when [dashboard].enable is false, so the
+        guarded emit() taps stay pure no-ops and the robot pays zero overhead."""
+        d = self.cfg.get("dashboard", {})
+        if not d.get("enable", False):
+            return
+        import dashboard  # lazy: only when explicitly enabled
+        obs = observatory.get_observatory()
+        obs.configure(
+            ring_size=d.get("ring_size", 500),
+            frame_max_bytes=d.get("frame_max_bytes", 65536),
+            frame_min_interval_s=d.get("frame_min_interval_s", 0.5),
+        )
+        with contextlib.suppress(asyncio.CancelledError):
+            await dashboard.serve_dashboard(
+                obs, d.get("host", "127.0.0.1"), d.get("port", 8772),
+                replay=d.get("replay", 200),
+            )
 
 
 def _resolve(path: str) -> str:

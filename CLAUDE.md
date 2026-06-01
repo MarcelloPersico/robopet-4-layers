@@ -4,8 +4,10 @@ Guidance for Claude Code working in this repository.
 
 > **State (2026-06-01):**
 > - **`desktop/`** — fully implemented and verified on this machine; runs
->   end-to-end (text / voice / vision). 84 tests pass (`desktop/tests`) — incl.
->   the dual-OLED "eyes" face path (`test_face.py`).
+>   end-to-end (text / voice / vision). 101 tests pass (`desktop/tests`) — incl.
+>   the dual-OLED "eyes" face path (`test_face.py`) and the read-only four-layer
+>   **Observatory dashboard** (`test_observatory.py` / `test_dashboard.py`;
+>   browser-verified + a live LM Studio smoke test 2026-06-02).
 > - **`pi/`** — implemented (`bridge.py`, `capture.py`, `wsclient.py`,
 >   `protocol.py`, `setup.sh`; 6 tests). **Bench-verified on hardware 2026-06-01**:
 >   provisioned a Pi Zero 2 W (Raspberry Pi OS Lite / Debian 13 trixie / py3.13),
@@ -129,6 +131,9 @@ Teensy's USB serial stays exposed for bench bringup.
 | `notifier.py` | toast / webhook / silent, throttled (1 per 10 min) | §8.5 |
 | `cli_queue.py` | CLI to inspect/resolve/dismiss the queue | §9 M8 |
 | `local_loop.py` | Run the pet brain on the desktop alone (no Pi/Teensy) | §8.7 |
+| `observatory.py` | In-process event bus (ring + pub/sub); zero-overhead no-op when the dashboard is off; the seam taps emit to it | §11 |
+| `dashboard.py` | Read-only four-layer "Observatory" web dashboard (one `websockets` listener = HTTP + WS) + standalone `--demo` simulator | §11 |
+| `dashboard.html` | Single-file UI: live dual-OLED **eyes** (faithful firmware port) + per-layer RECV/SEND/EXEC panes + camera thumbnails | §11 |
 | `persona.md` | Static, prefix-cacheable system-prompt portion | §5.4 |
 
 ### Agent loop (§5)
@@ -205,7 +210,9 @@ MoE) on `:1234` (`manage_server=false`), `mode="unified"`, `stream=true`,
 cd desktop
 pip install -e ".[dev]"
 python orchestrator.py          # launches the LLM server, wsserver, asr, vlm, tts, mcp
+                                #   (+ the Observatory dashboard when [dashboard].enable=true)
 python cli_queue.py             # inspect / resolve / dismiss the queue
+python dashboard.py             # standalone four-layer dashboard + demo on http://127.0.0.1:8772
 ```
 
 Run on the desktop alone (no Pi/Teensy; motion echoed to console):
@@ -247,10 +254,11 @@ GPU/hardware stack (heavy libs are lazy-imported):
 python -m venv .venv
 .\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
 .\.venv\Scripts\ruff check desktop pi          # clean
-.\.venv\Scripts\python -m pytest desktop       # 84 tests (protocol, queue, state, config,
+.\.venv\Scripts\python -m pytest desktop       # 101 tests (protocol, queue, state, config,
                                                #   tts, tools, agent loop, asr, half-duplex,
                                                #   ws loopback, MCP defer-to-human end-to-end,
-                                               #   face/eyes emote+look path)
+                                               #   face/eyes emote+look path, observatory bus,
+                                               #   dashboard HTTP+WS + demo feeder)
 .\.venv\Scripts\python -m pytest pi            # 6 tests (protocol, VAD audio-gate)
 ```
 The Teensy firmware needs PlatformIO; the full orchestrator needs the models + a

@@ -13,6 +13,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+from observatory import emit, emit_throttled
+
 RECENT_ANSWERS_MAX = 50
 CONVERSATION_MAX = 30
 TRANSCRIPTS_MAX = 12
@@ -71,6 +73,18 @@ class WorldState:
 
     def set_telemetry(self, snap: dict) -> None:
         self.last_telemetry = snap
+        # Observatory taps (Plan §11): the body's own view of itself. The 50 Hz
+        # stream is throttled to a few/sec for the SENDING pane; a derived exec
+        # event (kind == the current mode) drives the EXECUTING pane + hero face.
+        # Both no-op when the dashboard is disabled.
+        emit_throttled("teensy_telem", 0.5, "teensy", "send", "telemetry",
+                       self.render_telemetry_line(), snap)
+        emit("teensy", "exec", str(snap.get("mode", "active")),
+             f"mode={snap.get('mode', '?')} emotion={snap.get('emotion', '?')}",
+             {"mode": snap.get("mode"), "emotion": snap.get("emotion"),
+              "vel_l": snap.get("vel_l"), "vel_r": snap.get("vel_r"),
+              "duty_l": snap.get("duty_l"), "duty_r": snap.get("duty_r"),
+              "link_age_ms": snap.get("link_age_ms")})
 
     # --- recent-answers buffer ------------------------------------------------
     def add_resolution(self, fact: ResolvedFact) -> None:

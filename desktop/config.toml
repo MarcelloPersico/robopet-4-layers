@@ -104,3 +104,18 @@ idle_blink_min_ms = 2800   # min gap between autonomous idle blinks (mirrors cfg
 idle_blink_max_ms = 6000   # max gap between autonomous idle blinks
 bus_clock_hz = 1000000     # I2C FM+ (1 MHz); drop to 400000 on a marginal bus
 refresh_hz = 30            # logical eye refresh cap (>=30 Hz feels smooth)
+
+[dashboard]
+# Read-only four-layer "Observatory" web dashboard (Plan §11 observability).
+# OFF by default so the guarded emit() taps in the seam files stay pure no-ops
+# and the running robot pays zero overhead. Flip enable=true in config.local.toml
+# (or run `python dashboard.py` standalone with the built-in demo simulator).
+# Localhost-only by default; read-only (no control surface). port 8772 avoids
+# the wsserver (8765) / llama (8080) / MCP (8770) ports.
+enable = false
+host = "127.0.0.1"
+port = 8772
+replay = 200               # events replayed to a freshly-connected browser
+ring_size = 500            # recent-events ring kept for replay
+frame_max_bytes = 65536    # camera frames larger than this stream without a preview
+frame_min_interval_s = 0.5 # per-key throttle for video/audio taps (~2 fps)

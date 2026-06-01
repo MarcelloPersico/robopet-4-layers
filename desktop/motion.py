@@ -14,6 +14,8 @@ import json
 import logging
 from typing import Protocol
 
+from observatory import emit
+
 log = logging.getLogger("motion")
 
 
@@ -21,6 +23,31 @@ def _clamp(v, lo: float = -1.0, hi: float = 1.0) -> float:
     """Single wire boundary for normalized gaze: every caller (LLM/MCP/future)
     passes through here, so look_x/look_y always reach the Teensy in [-1,1]."""
     return max(lo, min(hi, float(v)))
+
+
+def _cmd_summary(obj: dict) -> str:
+    """One-line, human-readable summary of an outgoing Teensy command for the
+    Observatory dashboard (Plan §11). Pure formatting; never raises."""
+    t = obj.get("type", "cmd")
+    if t == "drive":
+        return (f"drive lin={obj.get('linear', 0):.2f} ang={obj.get('angular', 0):.2f} "
+                f"{obj.get('duration_ms', 0)}ms")
+    if t == "play":
+        return f"play {obj.get('name', '?')} x{obj.get('loops', 1)}"
+    if t == "set_idle":
+        return f"set_idle level={obj.get('level', 0)}"
+    if t == "face":
+        bits = []
+        if "emotion" in obj:
+            bits.append(str(obj["emotion"]))
+        if "look_x" in obj or "look_y" in obj:
+            bits.append(f"gaze({obj.get('look_x', 0)},{obj.get('look_y', 0)})")
+        if obj.get("blink"):
+            bits.append("blink")
+        return "face " + (" ".join(bits) if bits else "(hold)")
+    if t == "config":
+        return "config " + ",".join(k for k in obj if k != "type")
+    return t
 
 
 class UartSink(Protocol):
@@ -33,6 +60,9 @@ class Motion:
 
     async def _send(self, obj: dict) -> bool:
         line = json.dumps(obj, separators=(",", ":"))
+        # Observatory tap (Plan §11): the single chokepoint for every Teensy
+        # command, and what drives the dashboard's live face. No-op when off.
+        emit("teensy", "recv", obj.get("type", "cmd"), _cmd_summary(obj), obj)
         ok = await self._sink.send_uart(line)
         if not ok:
             log.debug("motion command dropped (no link): %s", line)

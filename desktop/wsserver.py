@@ -20,6 +20,7 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
 import protocol
+from observatory import emit, emit_throttled, frame_event
 
 log = logging.getLogger("wsserver")
 
@@ -79,6 +80,7 @@ class WsServer:
         peer = getattr(ws, "remote_address", "?")
         log.info("Pi connected: %s", peer)
         self._conns.add(ws)
+        emit("pi", "exec", "link-up", f"Pi connected: {peer}", {"peer": str(peer)})
         try:
             async for message in ws:
                 if isinstance(message, str):
@@ -96,13 +98,19 @@ class WsServer:
             if self._uart_peer is ws:
                 self._uart_peer = None
             log.info("Pi disconnected: %s", peer)
+            emit("pi", "exec", "link-down", f"Pi disconnected: {peer}", {"peer": str(peer)})
 
     def _route(self, ws: ServerConnection, channel: int, payload: bytes) -> None:
+        # Observatory taps (Plan §11): the link's view of what the Pi sends up.
+        # All no-op when the dashboard is disabled; media taps are throttled.
         if channel == protocol.CH_AUDIO:
             _put_drop_oldest(self.audio_in, payload)
+            emit_throttled("pi_audio", 0.5, "pi", "send", "audio",
+                           f"PCM {len(payload)}B", {"bytes": len(payload)})
         elif channel == protocol.CH_VIDEO:
             self.video_latest = payload
             self.video_event.set()
+            frame_event("pi", "send", "video", "frame", payload, key="pi_video")
         elif channel == protocol.CH_UART:
             self._uart_peer = ws  # this connection is the bridge
             try:
@@ -111,15 +119,22 @@ class WsServer:
                 return
             if line:
                 _put_drop_oldest(self.uart_in, line)
+                emit("pi", "send", "uart", line[:120], {"line": line})
         elif channel == protocol.CH_CONTROL:
             try:
-                _put_drop_oldest(self.control_in, protocol.decode_json(payload))
+                obj = protocol.decode_json(payload)
             except Exception as e:  # noqa: BLE001 - tolerate junk control frames
                 log.warning("bad control frame: %s", e)
+                return
+            _put_drop_oldest(self.control_in, obj)
+            emit("pi", "send", "vad", str(obj)[:80], obj)
 
     # --- outbound -------------------------------------------------------------
     async def send_uart(self, line: str) -> bool:
         """Send one line-delimited JSON command to the Teensy via the bridge."""
+        # Observatory tap (Plan §11): the command the Pi forwards down to the
+        # Teensy (the link's RECEIVING view). No-op when the dashboard is off.
+        emit("pi", "recv", "uart-down", line[:120], {"line": line})
         peer = self._uart_peer or next(iter(self._conns), None)
         return await self._send_to(peer, protocol.encode_uart(line))
 
