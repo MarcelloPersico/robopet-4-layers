@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import random
+import socket
 import time
 import webbrowser
 from pathlib import Path
@@ -424,9 +425,52 @@ async def _human_resolution(frame: int) -> None:
     )
 
 
+# --- optional mDNS (.local) advertising ---------------------------------------
+def _primary_lan_ip() -> str:
+    """The LAN IP on the default route (skips WSL/Hyper-V virtual adapters)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # no packet is sent; this just selects the egress iface
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+async def _advertise_mdns(name: str, port: int, ip: str):
+    """Publish ``<name>.local`` -> ``ip`` over mDNS so phones/laptops can reach the dashboard
+    by a memorable name instead of the IP. Lazy-imports ``zeroconf`` (optional dep). Returns
+    ``(aiozc, info)`` for cleanup, or ``None`` if zeroconf isn't installed.
+
+    Uses the async API on purpose: the sync ``Zeroconf.register_service`` deadlocks when
+    called from inside a running event loop (raises ``EventLoopBlocked``), so we await."""
+    try:
+        from zeroconf import ServiceInfo
+        from zeroconf.asyncio import AsyncZeroconf
+    except ImportError:
+        log.warning("zeroconf not installed; skipping mDNS (pip install zeroconf) -- use the IP")
+        return None
+    aiozc = AsyncZeroconf()
+    info = ServiceInfo(
+        "_http._tcp.local.",
+        f"{name}._http._tcp.local.",
+        addresses=[socket.inet_aton(ip)],
+        port=port,
+        server=f"{name}.local.",
+        properties={"path": "/"},
+    )
+    await aiozc.async_register_service(info)
+    return aiozc, info
+
+
 # --- CLI ----------------------------------------------------------------------
 async def _amain(args: argparse.Namespace) -> None:
     obs = get_observatory()
+    mdns = None
+    if getattr(args, "mdns_name", None):
+        ip = _primary_lan_ip()
+        mdns = await _advertise_mdns(args.mdns_name, args.port, ip)
+        if mdns:
+            log.info("mDNS: http://%s.local:%d  ->  %s", args.mdns_name, args.port, ip)
     tasks = [asyncio.create_task(serve_dashboard(obs, args.host, args.port), name="dashboard")]
     if args.demo:
         tasks.append(asyncio.create_task(demo_feeder(obs), name="demo"))
@@ -440,6 +484,11 @@ async def _amain(args: argparse.Namespace) -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if mdns:
+            aiozc, info = mdns
+            with contextlib.suppress(Exception):
+                await aiozc.async_unregister_service(info)
+                await aiozc.async_close()
 
 
 def main() -> None:
@@ -461,6 +510,8 @@ def main() -> None:
         help="serve an empty dashboard (attach a real orchestrator instead)",
     )
     parser.add_argument("--open", action="store_true", help="open a browser tab on startup")
+    parser.add_argument("--mdns-name", default=None,
+                        help="advertise http://<name>.local via mDNS (e.g. --mdns-name elena)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
