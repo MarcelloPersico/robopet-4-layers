@@ -248,7 +248,7 @@ class Orchestrator:
         with contextlib.suppress(asyncio.CancelledError):
             await dashboard.serve_dashboard(
                 obs, d.get("host", "127.0.0.1"), d.get("port", 8772),
-                replay=d.get("replay", 200),
+                replay=d.get("replay", 200), mdns_name=d.get("mdns_name") or None,
             )
 
 

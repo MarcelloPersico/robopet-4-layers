@@ -131,14 +131,24 @@ async def start_server(obs: Observatory, host: str, port: int, *, replay: int = 
     return server
 
 
-async def serve_dashboard(obs: Observatory, host: str, port: int, *, replay: int = 200) -> None:
-    """Start the dashboard and serve until cancelled, then disable the bus and close cleanly."""
+async def serve_dashboard(obs: Observatory, host: str, port: int, *, replay: int = 200,
+                          mdns_name: str | None = None) -> None:
+    """Start the dashboard and serve until cancelled, then disable the bus and close cleanly.
+
+    If ``mdns_name`` is set, also advertise ``<mdns_name>.local`` over mDNS so phones/laptops
+    can reach the LAN dashboard by a memorable name (e.g. http://elena.local:8772)."""
     if host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(
             "dashboard bound to %s:%d -- read-only A/V thumbnails + telemetry are LAN-exposed",
             host,
             port,
         )
+    mdns = None
+    if mdns_name:
+        ip = _primary_lan_ip()
+        mdns = await _advertise_mdns(mdns_name, port, ip)
+        if mdns:
+            log.info("mDNS: http://%s.local:%d  ->  %s", mdns_name, port, ip)
     server = await start_server(obs, host, port, replay=replay)
     log.info("observatory dashboard listening on http://%s:%d", host, port)
     try:
@@ -147,6 +157,11 @@ async def serve_dashboard(obs: Observatory, host: str, port: int, *, replay: int
         obs.enabled = False
         server.close()
         await server.wait_closed()
+        if mdns:
+            aiozc, info = mdns
+            with contextlib.suppress(Exception):
+                await aiozc.async_unregister_service(info)
+                await aiozc.async_close()
         raise
 
 
@@ -465,13 +480,8 @@ async def _advertise_mdns(name: str, port: int, ip: str):
 # --- CLI ----------------------------------------------------------------------
 async def _amain(args: argparse.Namespace) -> None:
     obs = get_observatory()
-    mdns = None
-    if getattr(args, "mdns_name", None):
-        ip = _primary_lan_ip()
-        mdns = await _advertise_mdns(args.mdns_name, args.port, ip)
-        if mdns:
-            log.info("mDNS: http://%s.local:%d  ->  %s", args.mdns_name, args.port, ip)
-    tasks = [asyncio.create_task(serve_dashboard(obs, args.host, args.port), name="dashboard")]
+    tasks = [asyncio.create_task(
+        serve_dashboard(obs, args.host, args.port, mdns_name=args.mdns_name), name="dashboard")]
     if args.demo:
         tasks.append(asyncio.create_task(demo_feeder(obs), name="demo"))
     if args.open:
@@ -484,11 +494,6 @@ async def _amain(args: argparse.Namespace) -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if mdns:
-            aiozc, info = mdns
-            with contextlib.suppress(Exception):
-                await aiozc.async_unregister_service(info)
-                await aiozc.async_close()
 
 
 def main() -> None:

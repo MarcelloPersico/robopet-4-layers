@@ -115,6 +115,7 @@ refresh_hz = 30            # logical eye refresh cap (>=30 Hz feels smooth)
 enable = false
 host = "127.0.0.1"
 port = 8772
+mdns_name = ""             # set to e.g. "elena" to also advertise http://elena.local (needs the [mdns] extra)
 replay = 200               # events replayed to a freshly-connected browser
 ring_size = 500            # recent-events ring kept for replay
 frame_max_bytes = 65536    # camera frames larger than this stream without a preview
