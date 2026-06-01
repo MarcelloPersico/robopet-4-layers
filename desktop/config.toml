@@ -93,3 +93,14 @@ persona = "persona.md"
 [idle]
 no_user_quiet_s = 30
 default_intensity = 0.6
+
+[face]
+# Dual-OLED "eyes" face subsystem (Plan §6 face). Desktop-side defaults only;
+# the authoritative real-time constants (bus clock, refresh, per-loop flush
+# budget) live in the firmware's cfg::face namespace (Config.h). These mirror the
+# firmware values for reference and let the agent/persona reason about the face.
+default_emotion = "neutral"
+idle_blink_min_ms = 2800   # min gap between autonomous idle blinks (mirrors cfg::face::IDLE_BLINK_MIN_MS)
+idle_blink_max_ms = 6000   # max gap between autonomous idle blinks
+bus_clock_hz = 1000000     # I2C FM+ (1 MHz); drop to 400000 on a marginal bus
+refresh_hz = 30            # logical eye refresh cap (>=30 Hz feels smooth)

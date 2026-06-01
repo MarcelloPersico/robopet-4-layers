@@ -17,6 +17,12 @@ from typing import Protocol
 log = logging.getLogger("motion")
 
 
+def _clamp(v, lo: float = -1.0, hi: float = 1.0) -> float:
+    """Single wire boundary for normalized gaze: every caller (LLM/MCP/future)
+    passes through here, so look_x/look_y always reach the Teensy in [-1,1]."""
+    return max(lo, min(hi, float(v)))
+
+
 class UartSink(Protocol):
     async def send_uart(self, line: str) -> bool: ...
 
@@ -47,6 +53,45 @@ class Motion:
 
     async def set_idle_intensity(self, level: float) -> bool:
         return await self._send({"type": "set_idle", "level": float(level)})
+
+    async def emote(
+        self,
+        emotion: str | None = None,
+        intensity: float = 1.0,
+        look_x: float | None = None,
+        look_y: float | None = None,
+        blink: bool = False,
+        hold_ms: int = 0,
+    ) -> bool:
+        """Drive the dual-OLED "eyes" face (Plan §3.1 / §6 face subsystem).
+
+        Emits one ``{"type":"face",...}`` line. Honors the "omitted field = keep
+        current" contract: keys whose Python value is None/falsy are *not*
+        serialized, so the firmware's presence flags keep the held mood and gaze.
+        ``intensity`` is always sent (default 1.0); gaze is clamped to [-1,1].
+        """
+        # intensity is always serialized (default 1.0); emotion/look_*/blink/
+        # hold_ms are dropped when None/falsy so "absent = keep current" survives
+        # the wire. Key order is irrelevant to the firmware's by-name JSON parse.
+        payload: dict = {"type": "face", "intensity": float(intensity)}
+        if emotion is not None:
+            payload["emotion"] = str(emotion)
+        if look_x is not None:
+            payload["look_x"] = _clamp(look_x)
+        if look_y is not None:
+            payload["look_y"] = _clamp(look_y)
+        if blink:
+            payload["blink"] = True
+        if hold_ms:
+            payload["hold_ms"] = int(hold_ms)
+        return await self._send(payload)
+
+    async def look(self, x: float, y: float) -> bool:
+        """Point the eyes' gaze: x,y in [-1,1] (omits emotion/intensity so the
+        held expression is preserved)."""
+        return await self._send(
+            {"type": "face", "look_x": _clamp(x), "look_y": _clamp(y)}
+        )
 
     async def configure(self, **fields) -> bool:
         """Push drivetrain geometry / PID gains to the Teensy (startup or tuning)."""

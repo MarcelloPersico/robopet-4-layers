@@ -9,6 +9,12 @@
 //   {"type":"config","wheel_radius_m":0.0325,"track_width_m":0.15,
 //                    "counts_per_rev":1440,"max_wheel_speed":0.6,
 //                    "kp":220,"ki":900,"kd":0}
+//   {"type":"face","emotion":"happy","look_x":0.0,"look_y":0.0,
+//                  "intensity":1.0,"blink":false,"hold_ms":0}
+//
+// `face` drives the dual-OLED eyes (Plan §6). All fields except "type" are
+// optional and presence-flagged so "omitted = keep current": an absent emotion
+// keeps the held mood, and look() (emotion omitted) must NOT wipe expression.
 //
 // One CommandParser instance per input Stream (USB + Serial1). Each accumulates
 // a line independently; oversized lines are discarded to resync.
@@ -18,7 +24,7 @@
 #include <ArduinoJson.h>
 #include "Config.h"
 
-enum class CmdType { kNone, kDrive, kStop, kPlay, kSetIdle, kPing, kConfig, kUnknown };
+enum class CmdType { kNone, kDrive, kStop, kPlay, kSetIdle, kPing, kConfig, kFace, kUnknown };
 
 struct Command {
   CmdType type = CmdType::kNone;
@@ -34,6 +40,13 @@ struct Command {
   cfg::Geometry geo{};
   cfg::PIDGains gains{};
   bool has_geo = false, has_gains = false;
+  // face (presence-flagged: omitted = keep current; see kFace handling in main)
+  char     emotion[16] = {0};            // "" => keep current
+  float    look_x = 0.0f, look_y = 0.0f;
+  float    intensity = 1.0f;
+  bool     blink = false;
+  uint32_t hold_ms = 0;
+  bool     has_emotion = false, has_look = false, has_intensity = false;
 };
 
 class CommandParser {
@@ -78,6 +91,19 @@ class CommandParser {
     else if (!strcmp(type, "ping"))     { out.type = CmdType::kPing; }
     else if (!strcmp(type, "config"))   { out.type = CmdType::kConfig;
                                           apply_config(doc, out); }
+    else if (!strcmp(type, "face"))     { out.type = CmdType::kFace;
+                                          // Presence-flagged so "omitted = keep current" is real.
+                                          if (doc["emotion"].is<const char*>()) {
+                                            strlcpy(out.emotion, doc["emotion"] | "", sizeof(out.emotion));
+                                            out.has_emotion = (out.emotion[0] != '\0');
+                                          }
+                                          out.has_look = doc["look_x"].is<float>() || doc["look_y"].is<float>();
+                                          if (out.has_look) { out.look_x = doc["look_x"] | 0.0f;
+                                                              out.look_y = doc["look_y"] | 0.0f; }
+                                          out.has_intensity = doc["intensity"].is<float>();
+                                          out.intensity = doc["intensity"] | 1.0f;
+                                          out.blink   = doc["blink"]   | false;
+                                          out.hold_ms = doc["hold_ms"] | 0; }
     else                                { out.type = CmdType::kUnknown; }
     return true;
   }

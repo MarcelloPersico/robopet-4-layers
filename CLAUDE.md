@@ -2,14 +2,25 @@
 
 Guidance for Claude Code working in this repository.
 
-> **State (2026-05-30):**
+> **State (2026-06-01):**
 > - **`desktop/`** — fully implemented and verified on this machine; runs
->   end-to-end (text / voice / vision). 62 tests pass (`desktop/tests`).
+>   end-to-end (text / voice / vision). 84 tests pass (`desktop/tests`) — incl.
+>   the dual-OLED "eyes" face path (`test_face.py`).
 > - **`pi/`** — implemented (`bridge.py`, `capture.py`, `wsclient.py`,
 >   `protocol.py`, `setup.sh`; 6 tests).
 > - **`teensy/`** — firmware implemented (`main.cpp` + MotorDriver, EncoderReader,
 >   PID, MotionPlanner, AnimationPlayer, ReflexEngine, CommandParser, Telemetry,
->   Watchdog headers); not yet bench-verified on hardware (M1/M2 bringup).
+>   Watchdog **+ the dual-OLED face subsystem: EmotionLibrary / EyeRenderer /
+>   FaceController**). **Bench-verified on hardware 2026-06-01** (USB serial): build
+>   + headless `teensy-cli` flash, 50 Hz telemetry / command parser / ping-pong,
+>   both dual-OLED eyes render+animate (required a fix — `FaceController::begin()`
+>   now calls `setPowerSave(0)`; the SSD1306 init seq leaves the panel off), both
+>   motors drive with closed-loop PID + encoders, 90 % PWM ceiling, and the
+>   stall-fault watchdog. Still TODO on hardware: per-wheel polarity convention
+>   (right encoder sign inverted) + `counts_per_rev` velocity scaling (M1 tuning),
+>   the link-loss unplug→stop test, and the `play` animation set. See
+>   `teensy/BRINGUP.md`. The hardware-free emotion/tween math has a host g++ unit
+>   test (`teensy/test/test_emotion_logic.cpp`).
 >
 > **Source of truth:** the full implementation plan (revision **r2**,
 > 2026-05-26) lives at
@@ -36,7 +47,16 @@ makes zero outbound LLM calls).
 ## Hardware (fixed — do not propose changes)
 
 - **Body — Teensy 4.1:** 2× brushed DC motors + quadrature encoders, **L298N**
-  H-bridge, 2 driven wheels (differential drive) + 1 caster. No IMU, no display.
+  H-bridge, 2 driven wheels (differential drive) + 1 caster. No IMU.
+- **Eyes — 2× 0.96" SSD1306 128×64 I2C OLEDs** on the Teensy = the robot's
+  expressive face. **LEFT on `Wire` (SDA=18, SCL=19) @ 0x3C; RIGHT on `Wire1`
+  (SDA=17, SCL=16) @ 0x3C** — two hardware buses, no address jumper, via U8g2's
+  stock `_HW_I2C` + `_2ND_HW_I2C` classes. The RIGHT encoder was relocated 16/17 →
+  **20/21** to free Wire1 for the eye (U8g2 has no Wire2 class). Procedural vector
+  eyes (Anki Vector/Cozmo style), drawn at runtime from per-eye parameters
+  (openness/slant/gaze/blink) with smooth tweening, idle "breathing," and blinks.
+  **3.3 V-ONLY:** Teensy pins are not 5 V tolerant — power each OLED VCC from
+  3.3 V so SDA/SCL idle at 3.3 V (never the neck's 5 V). See `teensy/BRINGUP.md`.
 - **Head — Raspberry Pi Zero 2 W:** Raspberry Pi OS Lite, headless. USB webcam
   with integrated mic. Connects to the Teensy via UART + 5 V + GND through the neck.
 - **Desktop:** Windows, **RTX 5070 Ti (16 GB VRAM)**, 64 GB RAM. Same LAN as Pi.
@@ -95,7 +115,7 @@ Teensy's USB serial stays exposed for bench bringup.
 | `llama_server.py` | Launch/readiness; `manages()` picks managed (we spawn llama.cpp) vs external (e.g. LM Studio) | §5, §8.1 |
 | `tts.py` | Sentence-streaming TTS; `build_tts()` → `TTS` (Piper) / `KokoroTTS` (Kokoro-82M) | §4, §8 |
 | `half_duplex.py` | `SpeakingState` — mutes the mic while the pet speaks (anti-echo) | §8.7 |
-| `motion.py` | Motion intents → Teensy JSON cmds (via WS UART channel) | §3.1 |
+| `motion.py` | Motion + face intents → Teensy JSON cmds (via WS UART channel); `emote()`/`look()` emit the `face` command | §3.1 |
 | `mcp_server.py` | In-process MCP server (live HTTP/SSE only): robot + queue tools | §3.3 |
 | `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. Named `pet_queue` (not `queue`) to avoid shadowing the stdlib `queue` that `concurrent.futures` imports. | §8.4 |
 | `tools.py` | Shared robot + queue tool implementations; agent loop and MCP server both call these in-process | §3.3, §5.1 |
@@ -108,7 +128,8 @@ Teensy's USB serial stays exposed for bench bringup.
 ### Agent loop (§5)
 Local LLM via an OpenAI-compatible server (managed `llama-server.exe` or external
 LM Studio), function-calling. Tools: `drive`, `play_animation`, `stop`, `see`,
-`speak`, `set_idle_intensity`, and **`queue_question`** (the deferral path).
+`speak`, `set_idle_intensity`, **`set_emotion`** + **`look`** (the dual-OLED eyes
+— 15 core emotions + gaze), and **`queue_question`** (the deferral path).
 System prompt = static `persona.md` + dynamic context (recent-answers buffer,
 last ~6 turns, recent `see()`, telemetry one-liner, new utterance).
 
@@ -220,13 +241,17 @@ GPU/hardware stack (heavy libs are lazy-imported):
 python -m venv .venv
 .\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
 .\.venv\Scripts\ruff check desktop pi          # clean
-.\.venv\Scripts\python -m pytest desktop       # 62 tests (protocol, queue, state, config,
+.\.venv\Scripts\python -m pytest desktop       # 84 tests (protocol, queue, state, config,
                                                #   tts, tools, agent loop, asr, half-duplex,
-                                               #   ws loopback, MCP defer-to-human end-to-end)
+                                               #   ws loopback, MCP defer-to-human end-to-end,
+                                               #   face/eyes emote+look path)
 .\.venv\Scripts\python -m pytest pi            # 6 tests (protocol, VAD audio-gate)
 ```
 The Teensy firmware needs PlatformIO; the full orchestrator needs the models + a
-connected Pi/Teensy.
+connected Pi/Teensy. The hardware-free emotion/tween math has a separate host
+g++ test — `teensy/test/run_host_tests.{ps1,sh}` builds and runs
+`teensy/test/test_emotion_logic.cpp` against `EmotionLibrary.h` alone (no Teensy
+toolchain, no OLED). Bench bringup (M1/M2 + eyes power-on) is `teensy/BRINGUP.md`.
 
 ## Conventions
 
@@ -248,7 +273,7 @@ connected Pi/Teensy.
 | M | Goal |
 |---|------|
 | M1 | Teensy motion bringup (USB serial): MotorDriver/Encoder/PID/MotionPlanner/CommandParser |
-| M2 | Teensy animations + ReflexEngine idle + Watchdog (unplug → stop ≤1.5 s) |
+| M2 | Teensy animations + ReflexEngine idle + Watchdog (unplug → stop ≤1.5 s) + dual-OLED eyes power-on (`face` cmd, ≤300 µs/tick I2C slice) — see `teensy/BRINGUP.md` |
 | M3 | Pi bridge bringup (UART↔WS through the neck); systemd `Restart=always` |
 | M4 | Pi capture: motion-gated JPEG + VAD-bounded PCM on correct channels |
 | M5 | Desktop models concurrently (VRAM < 13 GB); wav → ASR → agent → TTS |

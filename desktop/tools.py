@@ -100,6 +100,47 @@ AGENT_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "set_emotion",
+            "description": "Set the expression on your two OLED eyes. Emote to match your mood "
+                           "and what's happening. intensity 0..1 (default 1.0); optional look_x/look_y "
+                           "gaze in [-1,1]; hold_ms>0 reverts to neutral after that many ms.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emotion": {
+                        "type": "string",
+                        "enum": ["neutral", "happy", "sad", "angry", "surprised", "curious",
+                                 "sleepy", "love", "suspicious", "dizzy", "focused", "scared",
+                                 "excited", "bored", "wink"],
+                    },
+                    "intensity": {"type": "number", "default": 1.0},
+                    "look_x": {"type": "number"},
+                    "look_y": {"type": "number"},
+                    "hold_ms": {"type": "integer", "default": 0},
+                },
+                "required": ["emotion"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "look",
+            "description": "Point your eyes' gaze. x,y in [-1,1] (x: -1 left .. +1 right; "
+                           "y: -1 down .. +1 up). Keeps your current expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "queue_question",
             "description": "Defer a question you genuinely cannot answer well to the human. "
                            "Use only per the deferral policy; do not queue trivial questions.",
@@ -205,6 +246,19 @@ class RobotTools:
     async def set_idle_intensity(self, level: float) -> str:
         await self.motion.set_idle_intensity(level)
         return f"idle intensity set to {level}"
+
+    async def set_emotion(
+        self, emotion: str, intensity: float = 1.0,
+        look_x: Optional[float] = None, look_y: Optional[float] = None, hold_ms: int = 0,
+    ) -> str:
+        """Set the expression on the robot's two OLED eyes (Plan §3.1 face subsystem)."""
+        await self.motion.emote(emotion, intensity, look_x, look_y, hold_ms=hold_ms)
+        return f"showing {emotion}"
+
+    async def look(self, x: float, y: float) -> str:
+        """Point the eyes' gaze (keeps the current expression)."""
+        await self.motion.look(x, y)
+        return f"looking toward ({x}, {y})"
 
     async def queue_question(
         self, category: str, agent_guess: str, why_unsure: str, utterance: Optional[str] = None

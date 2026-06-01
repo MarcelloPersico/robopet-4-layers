@@ -79,6 +79,23 @@ def build_server(tools, name: str = "robot-desk-pet"):
         """Set idle 'breathing' intensity, 0 (still) to 1 (lively)."""
         return await tools.set_idle_intensity(level)
 
+    @mcp.tool()
+    async def set_emotion(
+        emotion: str, intensity: float = 1.0,
+        look_x: float | None = None, look_y: float | None = None, hold_ms: int = 0,
+    ) -> str:
+        """Set the robot's two OLED eyes. emotion is one of: neutral, happy, sad,
+        angry, surprised, curious, sleepy, love, suspicious, dizzy, focused,
+        scared, excited, bored, wink. intensity 0..1 (default 1.0); optional
+        look_x/look_y gaze in [-1,1]; hold_ms>0 reverts to neutral after that long."""
+        return await tools.set_emotion(emotion, intensity, look_x, look_y, hold_ms)
+
+    @mcp.tool()
+    async def look(x: float, y: float) -> str:
+        """Point the robot's eyes' gaze. x,y in [-1,1] (x: -1 left .. +1 right;
+        y: -1 down .. +1 up). Keeps the current expression."""
+        return await tools.look(x, y)
+
     _register_queue_tools(mcp, tools)
     return mcp
 

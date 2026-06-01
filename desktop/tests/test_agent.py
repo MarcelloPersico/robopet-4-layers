@@ -35,6 +35,14 @@ class RecordingTools:
         self.calls.append(("idle", level))
         return "ok"
 
+    async def set_emotion(self, emotion, intensity=1.0, look_x=None, look_y=None, hold_ms=0):
+        self.calls.append(("set_emotion", emotion, intensity, look_x, look_y, hold_ms))
+        return f"showing {emotion}"
+
+    async def look(self, x, y):
+        self.calls.append(("look", x, y))
+        return f"looking ({x}, {y})"
+
     async def queue_question(self, **k):
         self.calls.append(("queue_question", k))
         return "queued #1"

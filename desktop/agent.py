@@ -121,14 +121,15 @@ class AgentBrain:
         # streamable TTS; falls back to the buffered path otherwise.
         self.stream = stream
         self._client = httpx.AsyncClient(timeout=60.0)
+        # Map tool name -> bound handler. Built with getattr so a partial tools
+        # object (e.g. a test double) that omits a newer tool simply doesn't
+        # register it, rather than crashing construction; the live RobotTools
+        # implements them all. Unregistered names are reported by _run_tool.
         self._dispatch = {
-            "drive": tools.drive,
-            "play_animation": tools.play_animation,
-            "stop": tools.stop,
-            "see": tools.see,
-            "speak": tools.speak,
-            "set_idle_intensity": tools.set_idle_intensity,
-            "queue_question": tools.queue_question,
+            name: getattr(tools, name)
+            for name in ("drive", "play_animation", "stop", "see", "speak",
+                         "set_idle_intensity", "set_emotion", "look", "queue_question")
+            if hasattr(tools, name)
         }
 
     async def aclose(self) -> None:

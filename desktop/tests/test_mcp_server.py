@@ -60,6 +60,7 @@ def _make(tmp_path):
 
 EXPECTED_TOOLS = {
     "drive", "play_animation", "stop", "see", "speak", "set_idle_intensity",
+    "set_emotion", "look",
     "list_pending_questions", "get_pending_question", "next_pending_question",
     "resolve_pending_question", "dismiss_pending_question", "summarize_queue",
 }

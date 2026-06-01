@@ -21,6 +21,7 @@
 #include "CommandParser.h"
 #include "Telemetry.h"
 #include "Watchdog.h"
+#include "FaceController.h"
 
 namespace {
 
@@ -37,6 +38,7 @@ ReflexEngine reflex;
 CommandParser parser_usb, parser_pi;
 Telemetry telem;
 Watchdog wd;
+FaceController eyes;
 
 // Timekeeping
 elapsedMicros control_dt_us;
@@ -93,6 +95,21 @@ void handle(const Command& c, uint32_t now) {
       wd.feed_ping(now);
       apply_config(c);
       break;
+    case CmdType::kFace:
+      // Face is NOT a motion command: it proves the link is live (feed_ping) but
+      // must NOT set last_command_ms (body keeps idle-breathing while the eyes
+      // emote), must NOT cancel animations, and must NOT clear a latched fault.
+      wd.feed_ping(now);
+      // intensity OMITTED => keep current (pass the -1.0f sentinel that
+      // FaceState::set_emotion treats as "don't retarget intensity"), matching the
+      // "omitted = keep current" contract that emotion/look already honor. A bare
+      // look() (which sends no intensity key) must NOT snap the held expression
+      // back to full strength.
+      eyes.set_emotion(c.has_emotion ? c.emotion : nullptr,
+                       c.has_intensity ? c.intensity : -1.0f, c.hold_ms, now);
+      if (c.has_look) eyes.look(c.look_x, c.look_y);
+      if (c.blink)    eyes.blink(now);
+      break;
     case CmdType::kUnknown:
       telem.emit_log("warn", "unknown command type");
       break;
@@ -126,6 +143,10 @@ void setup() {
   wd.begin(now);
   last_command_ms = now;
   control_dt_us = 0;
+
+  // Dual-OLED eyes (Plan §6). begin() is non-hanging (bounded per-panel probe);
+  // a headless rig (no panels) degrades to a no-op so the body still runs.
+  if (!eyes.begin(now)) telem.emit_log("warn", "no OLED eyes detected");
 
   pinMode(LED_BUILTIN, OUTPUT);
 }
@@ -170,6 +191,19 @@ void loop() {
     }
   }
 
+  // --- Face / eyes ----------------------------------------------------------
+  // Runs OUTSIDE the 1 kHz control gate. update() splits its work across separate
+  // loop() passes: a ~30 Hz render-in-RAM pass (tick + raster + dirty diff) and
+  // flush passes that each ship at most cfg::face::FLUSH_BYTES_PER_LOOP bytes to
+  // ONE panel (ping-ponging L/R). The two costs never stack in one iteration, so
+  // it can never starve a control tick (<300 us budget).
+  {
+    const bool face_idle = wd.link_alive(now) && !anim.active() && !wd.faulted() &&
+                           (now - last_command_ms > cfg::IDLE_TIMEOUT_MS);
+    eyes.set_mode(current_mode(face_idle), now);  // kFault => x_x; kIdle => idle breathe
+    eyes.update(now);                             // render-in-RAM OR ONE bounded I2C slice
+  }
+
   // --- Reflex @ 10 Hz -------------------------------------------------------
   if (now - last_reflex_ms >= (1000UL / cfg::REFLEX_HZ)) {
     last_reflex_ms = now;
@@ -200,7 +234,7 @@ void loop() {
     telem.emit_state(enc_l.count(), enc_r.count(),
                      enc_l.velocity_mps(), enc_r.velocity_mps(),
                      motor_l.duty_frac(), motor_r.duty_frac(),
-                     wd.link_age_ms(now), current_mode(idle));
+                     wd.link_age_ms(now), current_mode(idle), eyes.emotion_name());
     digitalWriteFast(LED_BUILTIN, link_ok ? HIGH : ((now / 250) % 2));  // heartbeat LED
   }
 }

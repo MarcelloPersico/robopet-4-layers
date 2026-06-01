@@ -12,8 +12,11 @@ class Telemetry {
  public:
   void begin(Stream* a, Stream* b) { out_[0] = a; out_[1] = b; }
 
+  // `emotion` is the current FaceController emotion name (one of the 15 core
+  // strings). Additive trailing arg — existing fields/order are unchanged.
   void emit_state(int32_t enc_l, int32_t enc_r, float vel_l, float vel_r,
-                  float duty_l, float duty_r, uint32_t link_age_ms, Mode mode) {
+                  float duty_l, float duty_r, uint32_t link_age_ms, Mode mode,
+                  const char* emotion) {
     JsonDocument doc;
     doc["type"] = "telemetry";
     doc["enc_l"] = enc_l;
@@ -24,6 +27,7 @@ class Telemetry {
     doc["duty_r"] = round2(duty_r);
     doc["link_age_ms"] = link_age_ms;
     doc["mode"] = mode_str(mode);
+    doc["emotion"] = emotion;
     write(doc);
   }
 
