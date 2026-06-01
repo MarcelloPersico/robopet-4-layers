@@ -1,16 +1,11 @@
 """MCP server exposing the robot + queue tools. Plan §3.3.
 
-Two bindings, one tool surface (Plan §8.1):
-
-  * In-process HTTP/SSE — built by :func:`build_server` against the *live*
-    RobotTools the orchestrator already owns, so the human's Claude session
-    drives the same robot and the same WorldState as the local agent. This is
-    the primary, fully-wired path.
-
-  * Standalone stdio — ``python mcp_server.py`` (spawned by Claude Desktop via
-    claude_desktop_config.json). The orchestrator may not be running, so this
-    mode opens the queue SQLite directly and serves the *queue* tools only, for
-    offline triage. Live robot tools require the orchestrator's HTTP binding.
+One binding, one tool surface (Plan §8.1): an in-process HTTP/SSE server built by
+:func:`build_server` against the *live* RobotTools the orchestrator already owns,
+so the human's Claude session drives the same robot and the same WorldState as the
+local agent. A Claude client (the MCP inspector, or Claude Desktop via the
+mcp-remote bridge) connects to it while the orchestrator is running; there is no
+offline/queue-only mode.
 
 Targets the official `mcp` Python SDK (FastMCP, mcp>=1.0).
 """
@@ -22,12 +17,36 @@ from typing import Any
 
 log = logging.getLogger("mcp_server")
 
+# Surfaced to the human's Claude client so triage is a tight loop, not free-form
+# reasoning. The robot reacts to a shared resolution on its own (speaks + moves),
+# so the human's job is just: read the next question, answer it, resolve it.
+INSTRUCTIONS = (
+    "You triage a robot desk pet's queue of questions it couldn't answer on its "
+    "own. Keep it tight: minimal tool calls, no narration, no thinking out loud.\n"
+    "\n"
+    "The loop is:\n"
+    "1. Call `next_pending_question` to pull the oldest one. Its record already "
+    "includes the camera frame the robot saved when it asked, so you normally do "
+    "NOT need to look again.\n"
+    "2. Answer it directly and briefly. Only call `see` if the question is about "
+    "what the robot is looking at *right now* rather than the saved frame.\n"
+    "3. Call `resolve_pending_question` with a short, plain-language answer and "
+    "share_with_robot=true. That hands the answer to the robot, which then speaks "
+    "it in its own voice and moves if it fits. Do NOT call `speak`, `drive`, or "
+    "`play_animation` yourself — acting is the robot's job; you just supply the "
+    "answer.\n"
+    "4. Repeat from step 1 until the queue is empty.\n"
+    "\n"
+    "Dismiss a question only when it's junk or genuinely unanswerable. A short "
+    "honest answer is better than a long one."
+)
+
 
 def build_server(tools, name: str = "robot-desk-pet"):
     """Register the full tool surface against a live RobotTools object."""
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP(name)
+    mcp = FastMCP(name, instructions=INSTRUCTIONS)
 
     # --- robot tools (also let the human drive the pet from chat for demos) ---
     @mcp.tool()
@@ -68,31 +87,35 @@ def _register_queue_tools(mcp, tools) -> None:
     """Queue triage tools — the meaningful surface for the human path (Plan §3.3)."""
 
     @mcp.tool()
+    async def next_pending_question() -> Any:
+        """Start here. The oldest unanswered question, with the camera frame the
+        robot saved when it asked already inlined. Returns a 'queue empty' note
+        when nothing is pending."""
+        rec = await tools.next_pending_question()
+        if not rec:
+            return "The queue is empty — no pending questions."
+        return _payload_with_frame(rec)
+
+    @mcp.tool()
     async def list_pending_questions(status_filter: str = "pending", limit: int = 20) -> list[dict]:
         """List queued questions: id, ts, category, utterance, agent_guess, status."""
         return await tools.list_pending_questions(status_filter, limit)
 
     @mcp.tool()
     async def get_pending_question(id: int) -> Any:
-        """Full record for one question, including the saved camera frame."""
+        """Full record for one specific question, including the saved camera frame."""
         rec = await tools.get_pending_question(id)
         if not rec:
             return f"no such question #{id}"
-        frame_path = rec.get("frame_abspath")
-        if frame_path:
-            try:
-                from mcp.server.fastmcp import Image
-
-                return [_summarize(rec), Image(path=frame_path)]
-            except Exception as e:  # noqa: BLE001 - fall back to text-only
-                log.debug("image inline failed: %s", e)
-        return rec
+        return _payload_with_frame(rec)
 
     @mcp.tool()
     async def resolve_pending_question(
         id: int, resolution_text: str, share_with_robot: bool = True
     ) -> str:
-        """Resolve a question; if shared, the robot learns the answer."""
+        """Answer a question. With share_with_robot=true the robot is handed the
+        answer and reacts on its own — it speaks it in its own voice and moves if
+        it fits, so you don't need to call speak/drive yourself."""
         return await tools.resolve_pending_question(id, resolution_text, share_with_robot)
 
     @mcp.tool()
@@ -104,6 +127,20 @@ def _register_queue_tools(mcp, tools) -> None:
     async def summarize_queue() -> str:
         """One-line natural-language summary of the pending queue."""
         return await tools.summarize_queue()
+
+
+def _payload_with_frame(rec: dict) -> Any:
+    """Text summary + the saved camera frame inlined as an image, when present;
+    falls back to the raw record if the image can't be loaded."""
+    frame_path = rec.get("frame_abspath")
+    if frame_path:
+        try:
+            from mcp.server.fastmcp import Image
+
+            return [_summarize(rec), Image(path=frame_path)]
+        except Exception as e:  # noqa: BLE001 - fall back to text-only
+            log.debug("image inline failed: %s", e)
+    return rec
 
 
 def _summarize(rec: dict) -> str:
@@ -123,48 +160,3 @@ async def serve_http(tools, host: str, port: int) -> None:
     mcp.settings.port = port
     # FastMCP's async runner for the streamable-HTTP transport.
     await mcp.run_streamable_http_async()
-
-
-# --- standalone stdio entry (Claude Desktop) ---------------------------------
-class _QueueOnlyTools:
-    """Adapts a bare QueueDB to the queue-tool method names RobotTools exposes,
-    for offline triage when the orchestrator isn't running."""
-
-    def __init__(self, db) -> None:
-        self.db = db
-
-    async def list_pending_questions(self, status_filter="pending", limit=20):
-        return self.db.list_pending(status_filter, limit)
-
-    async def get_pending_question(self, id: int):
-        return self.db.get_question(id)
-
-    async def resolve_pending_question(self, id: int, resolution_text: str, share_with_robot: bool = True) -> str:
-        fact = self.db.resolve_question(id, resolution_text, share_with_robot)
-        if fact is None:
-            return f"resolved #{id}" if not share_with_robot else f"no such question #{id}"
-        return f"resolved #{id} (robot will learn this on its next start)"
-
-    async def dismiss_pending_question(self, id: int, reason: str) -> str:
-        return f"dismissed #{id}" if self.db.dismiss_question(id, reason) else f"no such question #{id}"
-
-    async def summarize_queue(self) -> str:
-        return self.db.summarize_queue()
-
-
-def main() -> None:
-    """`python mcp_server.py` — stdio server with queue-only tools."""
-    from mcp.server.fastmcp import FastMCP
-
-    from config import load_config
-    from pet_queue import QueueDB
-
-    cfg = load_config()
-    db = QueueDB(cfg["queue"]["db_path"], cfg["queue"]["frames_dir"])
-    mcp = FastMCP("robot-desk-pet-queue")
-    _register_queue_tools(mcp, _QueueOnlyTools(db))
-    mcp.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()

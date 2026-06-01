@@ -14,9 +14,9 @@
 #   - live MCP server : http://127.0.0.1:8770/mcp  (Claude drives this pet)
 #
 # This needs the FULL model stack (torch+CUDA, faster-whisper, kokoro), which lives
-# on the system Python — NOT the lightweight .venv (that one is for lint/tests/
-# stdio-MCP only). The script picks the right interpreter and tops up the two
-# pure-python deps it's missing (websockets + mcp, idempotent).
+# on the system Python — NOT the lightweight .venv (that one is for lint/tests
+# only). The script picks the right interpreter and tops up the two pure-python
+# deps it's missing (websockets + mcp, idempotent).
 #
 # NOTE: this is the DESKTOP-ONLY runner. To talk to the real Pi/Teensy body over
 # WebSocket instead, run `python desktop/orchestrator.py` (it takes mic audio from

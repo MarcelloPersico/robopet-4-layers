@@ -68,9 +68,9 @@ kokoro_lang = "a"           # 'a' American English, 'b' British English
 kokoro_device = "cuda"      # "cuda" or "cpu"
 
 [mcp]
-# stdio: invoked by Claude Desktop via claude_desktop_config.json
-# http:  bound on localhost for inspector / remote connectors
-enable_stdio = true
+# http: in-process HTTP/SSE, bound on localhost for the inspector / remote
+#       connectors (Claude Desktop via the mcp-remote bridge). Live only —
+#       runs inside the orchestrator against the live robot + WorldState.
 enable_http = true
 http_host = "127.0.0.1"
 http_port = 8770

@@ -70,6 +70,9 @@ class Orchestrator:
         )
         self._llama_proc: asyncio.subprocess.Process | None = None
         self._busy = asyncio.Lock()  # serialize agent turns / guard idle vs speech
+        # When the human resolves a queued question over MCP, make the robot react
+        # now instead of waiting for its next utterance (Plan §5.5).
+        self.tools.agent_deliver = self._deliver_to_agent
 
     # --- LLM server -----------------------------------------------------------
     async def _launch_llama(self) -> None:
@@ -87,10 +90,9 @@ class Orchestrator:
     # --- lifecycle ------------------------------------------------------------
     async def run(self) -> None:
         await self.ws.start()
-        # Seed the recent-answers buffer from resolutions the human shared back
-        # while the robot was off (e.g. triaged via Claude Desktop over MCP, which
-        # only persists to resolved_knowledge). Without this, the robot re-asks
-        # questions a human already answered. Plan §5.5, §8.4.
+        # Seed the recent-answers buffer from resolutions shared in earlier
+        # sessions (persisted to resolved_knowledge). Without this, the robot
+        # re-asks questions a human already answered. Plan §5.5, §8.4.
         seeded = self.queue.load_recent_resolutions(self.state.recent_answers.maxlen or 50)
         self.state.load_resolutions(seeded)
         if seeded:
@@ -167,6 +169,15 @@ class Orchestrator:
         async with self._busy:
             with contextlib.suppress(Exception):
                 await self.agent.handle_utterance(text)
+
+    async def _deliver_to_agent(self, topic: str, resolution: str) -> None:
+        """A human answered a deferred question over MCP; drive one agent turn so
+        the pet reacts (speaks/moves), under the same lock that serializes voice
+        turns so it can't collide with the idle loop or a live utterance."""
+        async with self._busy:
+            with contextlib.suppress(Exception):
+                await self.agent.deliver_answer(topic, resolution)
+        self.state.mark_activity()
 
     async def _idle_loop(self) -> None:
         import random

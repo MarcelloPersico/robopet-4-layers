@@ -126,6 +126,15 @@ class QueueDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def next_pending(self) -> Optional[dict[str, Any]]:
+        """Oldest still-pending question as a full record (like :meth:`get_question`),
+        or None. Lets the human's Claude triage one-at-a-time without listing first."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM pending_questions WHERE status='pending' ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+        return self.get_question(int(row["id"])) if row else None
+
     def get_question(self, qid: int) -> Optional[dict[str, Any]]:
         with self._lock:
             row = self._conn.execute(

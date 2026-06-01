@@ -2,6 +2,7 @@
 
 ## Revision history
 
+- **2026-06-01 — r3.** Dropped the offline stdio (Claude Desktop spawn-and-attach) MCP binding. The MCP server is now **live-only**: it runs in-process inside the orchestrator over the localhost HTTP/SSE binding, against the live robot + WorldState. A human's Claude connects to it while the robot is running (MCP inspector, claude.ai remote connector, or Claude Desktop via the `mcp-remote` bridge). Resolutions are handed straight to the local agent so the robot reacts on the spot, and still persist to `resolved_knowledge` for boot-seeding. Sections below that describe the stdio binding / queue-only offline mode are superseded by this note.
 - **2026-05-26 — r2.** Removed automated Anthropic API escalation. The local agent no longer holds an API key or calls `ask_claude`. Hard cases are now queued to a local SQLite-backed **pending-questions** queue and surfaced to the human via an MCP server; the human resolves them by chatting with Claude over their existing Pro/Max subscription (Claude Desktop or claude.ai), which inverts the integration: the robot pulls the human into the loop instead of pulling the cloud in automatically.
 - **2026-05-26 — r1.** Initial planning document.
 

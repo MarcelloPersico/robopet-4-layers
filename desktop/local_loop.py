@@ -15,8 +15,8 @@ Needs the llama-server + Qwen GGUF from config (the agent brain). Whisper is
 only loaded in --voice mode; Moondream + webcam only with --vision.
 
 With --mcp the same RobotTools that the local loop uses are also served over the
-MCP HTTP/SSE binding ([mcp] in config) — so a Claude client (Claude Desktop via
-the mcp-remote bridge, or the inspector) drives the *live* pet and shares its
+MCP HTTP/SSE binding ([mcp] in config) — so a Claude client (the MCP inspector, or
+Claude Desktop via the mcp-remote bridge) drives the *live* pet and shares its
 WorldState, exactly as in the full orchestrator (Plan §3.3, §8.7).
 """
 

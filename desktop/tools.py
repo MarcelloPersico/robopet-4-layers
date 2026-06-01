@@ -136,6 +136,11 @@ class RobotTools:
         #              see() + AgentBrain._maybe_attach_images.
         self.vision_mode = vision_mode
         self._pending_images: list[bytes] = []
+        # Set by the orchestrator: an ``async (topic, resolution) -> None`` hook
+        # that drives one agent turn so the robot *reacts now* to a human's
+        # answer (speaks/moves), instead of waiting for the next utterance.
+        # None in tests, where there's no live agent. (Plan §5.5)
+        self.agent_deliver = None
 
     async def _exec(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
@@ -224,6 +229,9 @@ class RobotTools:
     async def get_pending_question(self, id: int) -> Optional[dict]:
         return await self._exec(self.queue.get_question, id)
 
+    async def next_pending_question(self) -> Optional[dict]:
+        return await self._exec(self.queue.next_pending)
+
     async def resolve_pending_question(
         self, id: int, resolution_text: str, share_with_robot: bool = True
     ) -> str:
@@ -233,7 +241,12 @@ class RobotTools:
         if fact is None:
             return f"no such question #{id}"
         self.state.add_resolution(fact)  # feed the recent-answers buffer (Plan §5.5)
-        return f"resolved #{id} and shared with the robot"
+        # Push the answer to the live agent so the robot reacts immediately
+        # (speaks it in character, moves if it fits). Fire-and-forget so the MCP
+        # caller — the human's Claude — doesn't block on the robot's reaction.
+        if self.agent_deliver is not None:
+            asyncio.create_task(self.agent_deliver(fact.topic, fact.resolution))
+        return f"resolved #{id} and shared with the robot — it will react on its own now"
 
     async def dismiss_pending_question(self, id: int, reason: str) -> str:
         ok = await self._exec(self.queue.dismiss_question, id, reason)

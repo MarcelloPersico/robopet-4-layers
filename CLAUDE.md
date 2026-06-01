@@ -96,7 +96,7 @@ Teensy's USB serial stays exposed for bench bringup.
 | `tts.py` | Sentence-streaming TTS; `build_tts()` → `TTS` (Piper) / `KokoroTTS` (Kokoro-82M) | §4, §8 |
 | `half_duplex.py` | `SpeakingState` — mutes the mic while the pet speaks (anti-echo) | §8.7 |
 | `motion.py` | Motion intents → Teensy JSON cmds (via WS UART channel) | §3.1 |
-| `mcp_server.py` | In-process MCP server: robot + queue tools (HTTP/SSE in-process; stdio standalone) | §3.3 |
+| `mcp_server.py` | In-process MCP server (live HTTP/SSE only): robot + queue tools | §3.3 |
 | `pet_queue.py` | SQLite `pending_questions` + `resolved_knowledge`, frame snapshots. Named `pet_queue` (not `queue`) to avoid shadowing the stdlib `queue` that `concurrent.futures` imports. | §8.4 |
 | `tools.py` | Shared robot + queue tool implementations; agent loop and MCP server both call these in-process | §3.3, §5.1 |
 | `state.py` | `WorldState`; recent-answers buffer (deque 50) | §8.3, §5.5 |
@@ -120,18 +120,25 @@ trivial questions.
 ### Defer-to-human loop (§5, §8.4) — the cloud replacement
 `queue_question` → SQLite row + saved camera frame + pose/excerpt snapshot →
 throttled toast. The agent speaks a short in-character ack and continues. The
-human triages later via `cli_queue.py` or by chatting with Claude over MCP
-(`list_pending_questions`, `get_pending_question` (inlines the JPEG),
-`resolve_pending_question(..., share_with_robot=true)`, `dismiss_pending_question`,
-`summarize_queue`). Shared resolutions land in `resolved_knowledge`.
+human triages later via `cli_queue.py` or by chatting with Claude over MCP. The
+server ships **`instructions`** (mcp_server.py `INSTRUCTIONS`) that keep the
+human's Claude on a tight loop — `next_pending_question` (oldest one, inlines the
+JPEG) → answer → `resolve_pending_question(..., share_with_robot=true)` → repeat —
+instead of free-form reasoning or driving the body itself (`list_pending_questions`,
+`get_pending_question`, `dismiss_pending_question`, `summarize_queue` round out the
+surface). Shared resolutions land in `resolved_knowledge`.
 
-The robot **learns answers back** two ways: the in-process HTTP path updates the
-live `WorldState` recent-answers buffer immediately; the stdio (Claude Desktop)
-path persists to the DB, and **`orchestrator.run()` seeds the buffer from
-`resolved_knowledge` at boot** (`state.load_resolutions(queue.load_recent_resolutions())`).
-Either way the buffer is injected into the prompt every turn, so the robot stops
-re-asking. Eviction is by recency (deliberately simple). See **`desktop/MCP_SETUP.md`**
-for wiring Claude Desktop (stdio) or the HTTP/SSE binding.
+The robot **learns answers back** immediately: resolving over the live in-process
+HTTP binding updates the `WorldState` recent-answers buffer **and hands the answer
+to the agent so the robot reacts on the spot** (`tools.agent_deliver` →
+`orchestrator._deliver_to_agent` → `agent.deliver_answer`, run under `_busy`). The
+resolution is also persisted to `resolved_knowledge`, and **`orchestrator.run()`
+re-seeds the buffer from it at boot**
+(`state.load_resolutions(queue.load_recent_resolutions())`) so the robot doesn't
+re-ask across restarts. The buffer is injected into the prompt every turn; eviction
+is by recency (deliberately simple). The server is **live-only** — there is no
+offline/stdio queue-only mode. See **`desktop/MCP_SETUP.md`** for wiring the
+HTTP/SSE binding.
 
 ### Runtime switches (gitignored `config.local.toml`, deep-merged over `config.toml`)
 - **`[agent] manage_server`** — `true` launches & owns `llama-server.exe`;
@@ -145,7 +152,7 @@ for wiring Claude Desktop (stdio) or the HTTP/SSE binding.
 - **`[tts] backend`** — `piper` (CPU, default) or `kokoro` (Kokoro-82M neural).
 - **`[asr] vad_filter`** — adds Silero VAD on the final pass; off by default.
 - **`[mcp]`** — `enable_http`/`http_host`/`http_port`/`http_bearer_token` for the
-  HTTP/SSE binding (localhost-only by default), `enable_stdio` for Claude Desktop.
+  live in-process HTTP/SSE binding (localhost-only by default).
 
 **This machine's live config:** LM Studio serving **Gemma-4-26B-A4B** (multimodal
 MoE) on `:1234` (`manage_server=false`), `mode="unified"`, `stream=true`,
@@ -248,7 +255,7 @@ connected Pi/Teensy.
 | M6 | Full voice loop + motion; tune "ack within ~300 ms" |
 | M7 | VLM `see()` into the agent; 30-min sustained-operation test |
 | M8 | Pending-questions queue + `queue_question` + `cli_queue.py` + recent-answers buffer ✅ |
-| M9 | MCP server (stdio + HTTP/SSE) + Claude Desktop end-to-end + toast notifier ✅ |
+| M9 | MCP server (live HTTP/SSE) + Claude triage end-to-end + toast notifier ✅ |
 | M10 | Persona + animation library + idle/TTS/ack polish |
 | M11 | Reliability hardening: fault injection, structured logging, webhook backend |
 

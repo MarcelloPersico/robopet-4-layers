@@ -165,6 +165,27 @@ class AgentBrain:
             return await self._handle_streaming(messages)
         return await self._handle_buffered(messages)
 
+    async def deliver_answer(self, topic: str, resolution: str) -> str:
+        """A human just answered a question the pet had deferred (over MCP). Drive
+        one turn so the pet reacts *now* — say it in its own words, move if it
+        fits — reusing the same tool loop and streaming TTS as a spoken turn.
+
+        The answer is already in the recent-answers buffer (tools.resolve_*), so
+        this only injects a one-off framing message; it doesn't touch conversation
+        history. Plan §5.5."""
+        framed = (
+            "Your human just got back to you about something you'd set aside and "
+            "weren't sure about.\n"
+            f"What it was about: {topic}\n"
+            f"Their answer: {resolution}\n"
+            "React now, in character and out loud: tell them what you learned in "
+            "one short line, and add a small movement only if it fits. Keep it brief."
+        )
+        messages = self._build_messages(framed)
+        if self.stream and getattr(self.tools, "tts_streamable", False):
+            return await self._handle_streaming(messages)
+        return await self._handle_buffered(messages)
+
     async def _handle_buffered(self, messages: list[dict[str, Any]]) -> str:
         final_text = ""
         for _ in range(MAX_TOOL_ITERS):

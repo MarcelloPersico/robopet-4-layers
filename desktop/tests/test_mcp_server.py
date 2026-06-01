@@ -15,6 +15,8 @@ a tool *through the MCP layer* produces the right side effects on WorldState.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 import mcp_server
@@ -58,7 +60,7 @@ def _make(tmp_path):
 
 EXPECTED_TOOLS = {
     "drive", "play_animation", "stop", "see", "speak", "set_idle_intensity",
-    "list_pending_questions", "get_pending_question",
+    "list_pending_questions", "get_pending_question", "next_pending_question",
     "resolve_pending_question", "dismiss_pending_question", "summarize_queue",
 }
 
@@ -111,9 +113,10 @@ async def test_list_and_get_over_mcp(tmp_path):
 
 @pytest.mark.asyncio
 async def test_resolution_persists_and_seeds_on_restart(tmp_path):
-    """The stdio Claude Desktop path resolves into resolved_knowledge while the
-    robot is off; the orchestrator seeds it back on the next start. This proves
-    that path (orchestrator.run -> queue.load_recent_resolutions -> seed)."""
+    """A shared resolution persists into resolved_knowledge; the orchestrator
+    seeds it back into the recent-answers buffer on its next start, so the robot
+    doesn't re-ask across restarts (orchestrator.run -> load_recent_resolutions
+    -> seed)."""
     tools, st, q = _make(tmp_path)
     await tools.queue_question("object_identification", "a mug?", "low confidence", "what is this?")
     await tools.resolve_pending_question(1, "it's a coffee mug", share_with_robot=True)
@@ -122,6 +125,43 @@ async def test_resolution_persists_and_seeds_on_restart(tmp_path):
     fresh = WorldState()
     fresh.load_resolutions(q.load_recent_resolutions())
     assert "coffee mug" in fresh.render_recent_answers()
+
+
+@pytest.mark.asyncio
+async def test_next_pending_question_oldest_first(tmp_path):
+    """next_pending_question returns the OLDEST pending one (one-at-a-time triage),
+    and a plain 'empty' note when the queue drains."""
+    tools, _, _ = _make(tmp_path)
+    server = mcp_server.build_server(tools)
+
+    await tools.queue_question("novelty", "first guess", "unsure", "first?")
+    await tools.queue_question("reasoning", "second guess", "unsure", "second?")
+
+    got = await server.call_tool("next_pending_question", {})
+    assert got and got[0], "expected the oldest question, got nothing"
+
+    # Resolve #1 and #2; the queue should then report empty.
+    await tools.resolve_pending_question(1, "answer one", share_with_robot=False)
+    await tools.resolve_pending_question(2, "answer two", share_with_robot=False)
+    got = await server.call_tool("next_pending_question", {})
+    assert "empty" in str(got[0]).lower()
+
+
+@pytest.mark.asyncio
+async def test_resolve_pushes_answer_to_live_agent(tmp_path):
+    """Sharing a resolution must hand the answer to the live agent so the robot
+    reacts now (not just on its next utterance)."""
+    tools, _, _ = _make(tmp_path)
+    delivered = []
+
+    async def fake_deliver(topic, resolution):
+        delivered.append((topic, resolution))
+
+    tools.agent_deliver = fake_deliver
+    await tools.queue_question("object_identification", "a mug?", "low confidence", "what is this?")
+    await tools.resolve_pending_question(1, "it's a blue mug", share_with_robot=True)
+    await asyncio.sleep(0)  # let the fire-and-forget delivery task run
+    assert delivered and delivered[0][1] == "it's a blue mug"
 
 
 @pytest.mark.asyncio
