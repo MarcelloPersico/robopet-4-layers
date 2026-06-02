@@ -20,7 +20,11 @@ from pathlib import Path
 import llama_server
 from agent import AgentBrain
 from asr import ASR
+from cognition import CognitionEngine
 from config import load_config
+from embeddings import Embedder
+from memory import MemoryStore
+from mood import MoodState
 from motion import Motion
 from notifier import Notifier
 from pet_queue import QueueDB
@@ -76,6 +80,39 @@ class Orchestrator:
         # now instead of waiting for its next utterance (Plan §5.5).
         self.tools.agent_deliver = self._deliver_to_agent
 
+        # --- "alive" cognition subsystem (Plan §12). On by default; the kill switch
+        # is [cognition].enable=false. When off, nothing here is constructed (no DB,
+        # no embedder import) and the robot behaves exactly as before.
+        self.memory: MemoryStore | None = None
+        self.embedder: Embedder | None = None
+        self.mood: MoodState | None = None
+        self.cognition: CognitionEngine | None = None
+        cg = cfg.get("cognition", {})
+        if cg.get("enable", False):
+            mcfg = cfg.get("memory", {})
+            self.memory = MemoryStore(
+                _resolve(mcfg.get("db_path", "data/memory.sqlite")),
+                recency_half_life_s=mcfg.get("recency_half_life_s", 21600.0),
+            )
+            self.embedder = Embedder(
+                mcfg.get("embedding_model", "BAAI/bge-small-en-v1.5"),
+                mcfg.get("device", "cpu"),
+            )
+            mood_cfg = cfg.get("mood", {})
+            self.mood = MoodState(
+                half_life_s=mood_cfg.get("half_life_s", 1800.0),
+                circadian=mood_cfg.get("circadian", True),
+                baseline_pleasure=mood_cfg.get("baseline_pleasure", 0.1),
+            )
+            # Inject retrieved-memory + mood context into every spoken turn, and
+            # persist dialogue the robot speaks.
+            self.agent.memory_render = self._render_memory_block
+            self.tools.on_memory = self._record_memory
+            self.cognition = CognitionEngine(
+                agent=self.agent, state=self.state, memory=self.memory, mood=self.mood,
+                tools=self.tools, embedder=self.embedder, busy=self._busy, cfg=cg,
+            )
+
     # --- LLM server -----------------------------------------------------------
     async def _launch_llama(self) -> None:
         a = self.cfg["agent"]
@@ -112,6 +149,14 @@ class Orchestrator:
         # Push drivetrain config + initial idle intensity to the Teensy.
         await self.motion.set_idle_intensity(self.cfg["idle"].get("default_intensity", 0.6))
 
+        # Pre-warm the embedding model off the loop so the first user turn / cognition
+        # tick doesn't block the event loop on the (one-time) model load.
+        if self.cognition is not None:
+            log.info("cognition enabled: pre-warming embedder + memory")
+            with contextlib.suppress(Exception):
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self.embedder.encode, "warmup")
+
         tasks = [
             asyncio.create_task(self._audio_router(), name="audio_router"),
             asyncio.create_task(self._control_router(), name="control_router"),
@@ -122,6 +167,7 @@ class Orchestrator:
             asyncio.create_task(self._health_loop(), name="health"),
             asyncio.create_task(self._serve_mcp(), name="mcp"),
             asyncio.create_task(self._serve_dashboard(), name="dashboard"),
+            asyncio.create_task(self._serve_cognition(), name="cognition"),
         ]
         log.info("orchestrator running (%d tasks)", len(tasks))
         try:
@@ -141,6 +187,9 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._llama_proc.wait(), timeout=5.0)
         self.queue.close()
+        if self.memory is not None:
+            with contextlib.suppress(Exception):
+                self.memory.close()
 
     # --- routers / loops ------------------------------------------------------
     async def _audio_router(self) -> None:
@@ -173,6 +222,8 @@ class Orchestrator:
     async def _on_utterance(self, text: str) -> None:
         log.info("user: %s", text)
         self.state.add_transcript(text)
+        if self.memory is not None:  # remember what the human said (Plan §12)
+            self._record_memory("dialogue", f"Human said: {text}", source="user")
         # Latency hiding (Plan §5.6 step 1): visible reaction within ~300 ms.
         await self.motion.play_animation("perk_up")
         async with self._busy:
@@ -186,9 +237,15 @@ class Orchestrator:
         async with self._busy:
             with contextlib.suppress(Exception):
                 await self.agent.deliver_answer(topic, resolution)
+        if self.memory is not None:  # remember the fact the human taught it (Plan §12)
+            self._record_memory("resolution", f"{topic} -> {resolution}", source="resolve")
         self.state.mark_activity()
 
     async def _idle_loop(self) -> None:
+        # When cognition is enabled it subsumes idle behavior (the monologue decides
+        # glances/emotes far better than dice rolls); don't run two timers on _busy.
+        if self.cognition is not None:
+            return
         import random
         quiet = self.cfg["idle"].get("no_user_quiet_s", 30)
         while True:
@@ -251,6 +308,48 @@ class Orchestrator:
                 obs, d.get("host", "127.0.0.1"), d.get("port", 8772),
                 replay=d.get("replay", 200), mdns_name=d.get("mdns_name") or None,
             )
+
+    # --- cognition (Plan §12) -------------------------------------------------
+    async def _serve_cognition(self) -> None:
+        """Run the internal-monologue tick loop. No-op when cognition is disabled."""
+        if self.cognition is None:
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.cognition.run()
+
+    def _render_memory_block(self, query: str) -> str | None:
+        """Sync hook (agent._memory_block): top-K retrieved memories + mood line for
+        the next spoken turn. Runs encode+retrieve inline (~10 ms; the embedder is
+        pre-warmed in run()). Returns None when there's nothing to add. Never raises."""
+        if self.memory is None:
+            return None
+        try:
+            q = self.embedder.encode(query)
+            k = self.cfg.get("cognition", {}).get("max_retrieved_memories", 5)
+            mems = self.memory.retrieve(q, k=k)
+        except Exception:  # noqa: BLE001 - memory must never break a turn
+            log.debug("memory retrieval failed", exc_info=True)
+            return None
+        if not mems:
+            return self.mood.render()
+        lines = "\n".join(f"- {m.content}" for m in mems)
+        return f"What you remember that may be relevant:\n{lines}\n\n{self.mood.render()}"
+
+    def _record_memory(self, kind: str, content: str, source: str | None = None) -> None:
+        """Sync, fire-and-forget memory write (tools.on_memory / utterance / resolution).
+        Schedules embed+add off the loop so the caller never blocks."""
+        if self.memory is None:
+            return
+        with contextlib.suppress(RuntimeError):  # no running loop → skip
+            asyncio.create_task(self._remember_async(kind, content, source))
+
+    async def _remember_async(self, kind: str, content: str, source: str | None) -> None:
+        if self.memory is None:
+            return
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(Exception):
+            emb = await loop.run_in_executor(None, self.embedder.encode, content)
+            await loop.run_in_executor(None, self.memory.add, kind, content, None, emb, source)
 
 
 def _resolve(path: str) -> str:

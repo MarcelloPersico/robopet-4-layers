@@ -182,6 +182,10 @@ class RobotTools:
         # answer (speaks/moves), instead of waiting for the next utterance.
         # None in tests, where there's no live agent. (Plan §5.5)
         self.agent_deliver = None
+        # Set by the orchestrator when cognition is enabled: a sync
+        # ``(kind, content, *, source) -> None`` sink that persists a memory
+        # (fire-and-forget; never blocks). None in tests / cognition off. (Plan §12)
+        self.on_memory = None
 
     async def _exec(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
@@ -224,6 +228,8 @@ class RobotTools:
     async def speak(self, text: str) -> str:
         await self.tts.say(text)
         self.state.add_assistant_turn(text)
+        if self.on_memory is not None:
+            self.on_memory("dialogue", text, source="robot")
         return "spoke"
 
     # --- streaming speech (agent.py feeds the speak() text as Gemma generates) -

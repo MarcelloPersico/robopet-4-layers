@@ -10,6 +10,8 @@ AgentBrain unchanged; only the I/O endpoints differ (see local_io.py).
     python local_loop.py --no-tts        # don't synthesize speech (print only)
     python local_loop.py --voice --mcp   # + expose the live MCP HTTP server so the
                                          #   human's Claude can drive this same pet
+    python local_loop.py --alive         # + internal monologue / learning memory / mood
+                                         #   (the pet thinks & emotes on its own between turns)
 
 Needs the llama-server + Qwen GGUF from config (the agent brain). Whisper is
 only loaded in --voice mode; Moondream + webcam only with --vision.
@@ -109,6 +111,55 @@ async def amain(args: argparse.Namespace) -> None:
         stream=cfg["agent"].get("stream", True),
     )
 
+    # --- optional "alive" cognition (Plan §12): internal monologue + memory + mood,
+    # running on the desktop alone. Everything is behind --alive so the default loop
+    # is unchanged. The tick shares `busy` with handle() so they never collide.
+    busy = asyncio.Lock()
+    memory = None
+    cognition = None
+    embedder = None
+    record_memory = None
+    if args.alive:
+        from cognition import CognitionEngine
+        from embeddings import Embedder
+        from memory import MemoryStore
+        from mood import MoodState
+        mcfg = cfg.get("memory", {})
+        memory = MemoryStore(_resolve(mcfg.get("db_path", "data/memory.sqlite")),
+                             recency_half_life_s=mcfg.get("recency_half_life_s", 21600.0))
+        embedder = Embedder(mcfg.get("embedding_model", "BAAI/bge-small-en-v1.5"),
+                            mcfg.get("device", "cpu"))
+        mcg = cfg.get("mood", {})
+        mood = MoodState(half_life_s=mcg.get("half_life_s", 1800.0),
+                         circadian=mcg.get("circadian", True),
+                         baseline_pleasure=mcg.get("baseline_pleasure", 0.1))
+        k = cfg.get("cognition", {}).get("max_retrieved_memories", 5)
+
+        def _render_memory_block(query: str):
+            try:
+                mems = memory.retrieve(embedder.encode(query), k=k)
+            except Exception:
+                return mood.render()
+            if not mems:
+                return mood.render()
+            lines = "\n".join(f"- {m.content}" for m in mems)
+            return f"What you remember that may be relevant:\n{lines}\n\n{mood.render()}"
+
+        def record_memory(kind, content, source=None):  # noqa: F811 - intentional rebind
+            async def _w():
+                loop = asyncio.get_running_loop()
+                with contextlib.suppress(Exception):
+                    emb = await loop.run_in_executor(None, embedder.encode, content)
+                    await loop.run_in_executor(None, memory.add, kind, content, None, emb, source)
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(_w())
+
+        agent.memory_render = _render_memory_block
+        tools.on_memory = record_memory
+        cognition = CognitionEngine(agent=agent, state=state, memory=memory, mood=mood,
+                                    tools=tools, embedder=embedder, busy=busy,
+                                    cfg=cfg.get("cognition", {}))
+
     # Managed mode: we launch llama-server. External mode (manage_server=false,
     # e.g. LM Studio): the server is already running — just connect to it.
     managed = llama_server.manages(cfg["agent"])
@@ -136,10 +187,19 @@ async def amain(args: argparse.Namespace) -> None:
             log.info("MCP HTTP server on http://%s:%s/mcp — Claude can drive this pet",
                      m["http_host"], m["http_port"])
 
+        if args.alive:
+            with contextlib.suppress(Exception):  # pre-warm the embedder off the loop
+                await asyncio.get_running_loop().run_in_executor(None, embedder.encode, "warmup")
+            tasks.append(asyncio.create_task(cognition.run(), name="cognition"))
+            log.info("cognition enabled — the pet thinks, remembers, and emotes on its own")
+
         async def handle(text: str) -> None:
             print(f"\n🧑 {text}")
-            with contextlib.suppress(Exception):
-                await agent.handle_utterance(text)
+            if record_memory is not None:
+                record_memory("dialogue", f"Human said: {text}", source="user")
+            async with busy:  # serialize with the cognition tick (no-op without --alive)
+                with contextlib.suppress(Exception):
+                    await agent.handle_utterance(text)
 
         _banner(args)
         if args.voice:
@@ -165,6 +225,9 @@ async def amain(args: argparse.Namespace) -> None:
             proc.terminate()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
+        if memory is not None:
+            with contextlib.suppress(Exception):
+                memory.close()
         queue.close()
 
 
@@ -188,6 +251,8 @@ def _banner(args: argparse.Namespace) -> None:
         extras.append("no-tts")
     if args.mcp:
         extras.append("mcp")
+    if args.alive:
+        extras.append("alive")
     print(f"\n=== robot desk pet — local loop ({mode}{', ' + ', '.join(extras) if extras else ''}) ===")
     print("    (no Teensy: movements are printed; no Pi: using desktop mic/webcam)\n")
 
@@ -205,6 +270,9 @@ def main() -> None:
     p.add_argument("--no-tts", action="store_true", help="print speech instead of synthesizing it")
     p.add_argument("--mcp", action="store_true",
                    help="also serve the live MCP HTTP binding so Claude can drive this pet")
+    p.add_argument("--alive", action="store_true",
+                   help="enable the cognition loop (internal monologue + learning memory + mood) "
+                        "on the desktop alone — the pet thinks/emotes/remembers between turns")
     p.add_argument("--asr-device", default="cuda", choices=["cpu", "cuda"],
                    help="Whisper device (default cuda; ~0.14s/utterance on the 5070 Ti)")
     p.add_argument("--vlm-device", default="cuda", choices=["cpu", "cuda"],

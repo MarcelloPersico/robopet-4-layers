@@ -19,6 +19,10 @@ dependencies = [
     "tomli>=2; python_version < '3.11'",
     # Optional neural TTS backend ([tts] backend = "kokoro"); lazy-imported.
     "kokoro>=0.9",
+    # Local sentence embeddings for the cognition memory stream (Plan §12). Core
+    # because cognition is on by default; lazy-imported in embeddings.py so the
+    # lint/test .venv (which doesn't pip-install this project) never loads it.
+    "sentence-transformers>=3.0",
     # GPU ASR: ctranslate2's CUDA-12 build needs these runtime libs (cublas64_12,
     # cuDNN 9). asr.py registers their DLL dirs when device='cuda' on Windows.
     "nvidia-cublas-cu12; sys_platform == 'win32'",

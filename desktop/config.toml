@@ -126,3 +126,49 @@ replay = 200               # events replayed to a freshly-connected browser
 ring_size = 500            # recent-events ring kept for replay
 frame_max_bytes = 65536    # camera frames larger than this stream without a preview
 frame_min_interval_s = 0.5 # per-key throttle for video/audio taps (~2 fps)
+
+[cognition]
+# The "alive" loop (Plan §12): a background internal monologue that thinks, emotes,
+# learns, and occasionally speaks on its own between conversations. ON by default;
+# set enable=false to fully disable it (kill switch). When on, it SUBSUMES the
+# random [idle] loop. See desktop/COGNITION.md.
+enable = true
+tick_interval_s = 45.0      # base seconds between cognitive ticks (conservative on a 26B model;
+                           #   lower it after switching to a smaller model — see COGNITION.md)
+jitter_s = 15.0            # added random 0..jitter so ticks aren't metronomic
+speak_cooldown_s = 180.0   # min seconds between spontaneous spoken remarks (Balanced)
+speak_probability = 0.15   # chance a speak-eligible tick is actually allowed to speak (Balanced)
+reflection_importance_threshold = 12.0  # summed new-memory importance that triggers a reflection
+max_retrieved_memories = 5 # top-K memories injected per turn/tick (keep small — token budget)
+sleep_hours = []           # e.g. [0,1,2,3,4,5,6] for sleepy eyes + no thinking/speaking at night
+
+[memory]
+# Persistent, ever-growing memory stream (separate from the queue DB). Stores
+# dialogue, human-taught facts, and the robot's own thoughts/reflections — NOT raw
+# camera frames (vision stays in-the-moment; enforced by not wiring a see()->memory
+# hook). Embeddings via a small local model power relevance-scored recall.
+db_path = "data/memory.sqlite"
+embedding_model = "BAAI/bge-small-en-v1.5"  # 384-d, CPU-ok, lazy-loaded
+device = "cpu"
+recency_half_life_s = 21600  # 6h: how fast a memory's recency score fades
+max_rows = 5000              # optional eviction ceiling (0 = keep everything); not auto-run yet
+llm_rate_importance = false  # reserved: true = ask the model to rate importance (extra calls)
+persist_vision = false       # locked decision; reserved flag (vision is never persisted today)
+
+[mood]
+# Persistent PAD affect: a slow tide that colors expression + generation (Plan §12).
+half_life_s = 1800          # mood relaxes halfway toward baseline every 30 min
+circadian = true            # gentle time-of-day baseline (calmer at night, brighter midday)
+baseline_pleasure = 0.1     # the robot's resting good humor
+
+# Model-swap / prompt-cache plumbing (managed llama.cpp ONLY; ignored by LM Studio).
+# Frequent cognition ticks make caching worthwhile — see desktop/COGNITION.md. Add these
+# under [agent] in config.local.toml when you move off LM Studio to a smaller GGUF model:
+#   [agent]
+#   model_path  = "C:/models/qwen3-8b-instruct-q4_k_m.gguf"
+#   ctx_size    = 16384       # bigger context for memory-rich prompts
+#   cache_reuse = 256         # llama.cpp prefix-cache reuse window (tokens)
+#   cache_type_k = "q8_0"     # quantize the KV cache so a bigger ctx fits in 16 GB
+#   cache_type_v = "q8_0"
+#   flash_attn  = true        # required with a quantized V cache
+#   slot_save_path = "data/llm_cache"   # persist/restore prompt-cache slots across restarts

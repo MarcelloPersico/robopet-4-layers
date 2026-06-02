@@ -20,6 +20,10 @@ desktop/data/queue.sqlite-journal
 desktop/data/queue.sqlite-wal
 desktop/data/queue.sqlite-shm
 desktop/data/pending_frames/*.jpg
+desktop/data/memory.sqlite
+desktop/data/memory.sqlite-journal
+desktop/data/memory.sqlite-wal
+desktop/data/memory.sqlite-shm
 
 # Secrets / local config
 desktop/config.local.toml

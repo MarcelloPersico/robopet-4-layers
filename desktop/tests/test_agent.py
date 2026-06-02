@@ -2,8 +2,33 @@
 so no model or network is involved."""
 
 
-from agent import AgentBrain, _SpeakArgStreamer
+from agent import (
+    AgentBrain,
+    _is_pure_tool_calls,
+    _parse_text_tool_calls,
+    _SpeakArgStreamer,
+    _strip_reasoning,
+)
+from mood import MoodState
 from state import WorldState
+
+
+def test_strip_reasoning_removes_leaked_chain_of_thought():
+    # Clean text and benign "<" are untouched.
+    assert _strip_reasoning("morning! i was watching the window.") == "morning! i was watching the window."
+    assert _strip_reasoning("i have < 3 thoughts") == "i have < 3 thoughts"
+    # Closed reasoning blocks are removed.
+    assert _strip_reasoning("<think>plan the spin</think>okay, spinning!") == "okay, spinning!"
+    # The exact Gemma leak seen in the benchmark (unclosed marker → dump to EOF).
+    assert _strip_reasoning("<|thought|>\nThinking Process:\n1. Analyze...") == ""
+    assert _strip_reasoning("sure! <|thought| long reasoning that never closes") == "sure!"
+
+
+class _Mem:
+    """Minimal memory double (think() only reads .content)."""
+
+    def __init__(self, content):
+        self.content = content
 
 
 class RecordingTools:
@@ -218,4 +243,86 @@ async def test_streaming_content_only_falls_back_to_speak():
     final = await agent.handle_utterance("tell me")
     assert final == "a longer spoken answer"
     assert tools.spoken == ["a longer spoken answer"]  # voiced via buffered fallback
+    await agent.aclose()
+
+
+# --- internal monologue (think) ----------------------------------------------
+
+async def test_think_silent_tick_emotes_but_never_voices():
+    tools = RecordingTools()
+    agent = _make_agent(tools)
+    seen_tools = []
+    script = [
+        _msg(content="hmm, a quiet desk.",
+             tool_calls=[_tool_call("c1", "set_emotion", '{"emotion":"curious"}')]),
+        _msg(content="i think i'll just watch the window."),
+    ]
+    calls = iter(script)
+
+    def chat(messages, tools=None):
+        seen_tools.append(tools)
+        return _async(next(calls))
+
+    agent._chat = chat
+    thought, spoke = await agent.think("It is quiet.", [_Mem("the window is bright")],
+                                       MoodState(), allow_speak=False)
+    assert spoke is False
+    assert tools.spoken == []                       # a silent tick NEVER voices
+    assert thought == "i think i'll just watch the window."  # content captured, not spoken
+    assert any(c[0] == "set_emotion" for c in tools.calls)  # structured emote still dispatched
+    assert seen_tools[0] == []                      # silent ticks offer NO tools (prose-only)
+    assert len(agent.state.conversation) == 0       # the private thought is not a turn
+    await agent.aclose()
+
+
+def test_parse_text_tool_calls():
+    calls = _parse_text_tool_calls('set_emotion("sad", intensity=0.7)\nplay_animation(name="spin")')
+    assert calls == [
+        {"name": "set_emotion", "arguments": {"emotion": "sad", "intensity": 0.7}},
+        {"name": "play_animation", "arguments": {"name": "spin"}},
+    ]
+    assert _parse_text_tool_calls("good morning, friend!") == []          # prose ignored
+    assert _is_pure_tool_calls('set_emotion("happy")') is True
+    assert _is_pure_tool_calls('i will spin\nplay_animation(name="spin")') is False  # has prose
+
+
+def test_parse_handles_markdown_bullets_and_multiple_per_line():
+    c = '- `set_emotion("curious", intensity=0.9)`, `look(x=0, y=-0.2)`\n- `see()`'
+    assert [x["name"] for x in _parse_text_tool_calls(c)] == ["set_emotion", "look", "see"]
+    assert _is_pure_tool_calls(c) is True  # all calls + markdown → execute, don't speak
+
+
+async def test_buffered_executes_text_tool_calls_instead_of_speaking():
+    """A weak model writes tool calls as text; the agent must EXECUTE them (and voice
+    only the speak text), not read the syntax aloud."""
+    tools = RecordingTools()
+    agent = _make_agent(tools)
+    script = [_msg(content='set_emotion("happy")\nspeak("Good morning!")')]
+    calls = iter(script)
+    agent._chat = lambda messages: _async(next(calls))
+    await agent.handle_utterance("hi")
+    assert ("set_emotion", "happy", 1.0, None, None, 0) in tools.calls  # ran as a real tool
+    assert tools.spoken == ["Good morning!"]                            # spoke the text, not syntax
+    await agent.aclose()
+
+
+async def test_think_allow_speak_can_speak():
+    tools = RecordingTools()
+    agent = _make_agent(tools)
+    seen_tools = []
+    script = [
+        _msg(tool_calls=[_tool_call("c1", "speak", '{"text":"hey, the light changed."}')]),
+        _msg(content=""),
+    ]
+    calls = iter(script)
+
+    def chat(messages, tools=None):
+        seen_tools.append(tools)
+        return _async(next(calls))
+
+    agent._chat = chat
+    thought, spoke = await agent.think("The light changed.", [], MoodState(), allow_speak=True)
+    assert spoke is True
+    assert tools.spoken == ["hey, the light changed."]
+    assert "speak" in {s["function"]["name"] for s in seen_tools[0]}  # speak offered this tick
     await agent.aclose()

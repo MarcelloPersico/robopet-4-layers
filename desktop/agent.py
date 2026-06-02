@@ -13,9 +13,11 @@ so the orchestrator's TTS is driven by tool calls (Plan §5, persona rules).
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -26,6 +28,109 @@ from tools import AGENT_TOOL_SPECS, RobotTools
 log = logging.getLogger("agent")
 
 MAX_TOOL_ITERS = 5
+
+# Some local models leak chain-of-thought into the assistant *content* even with
+# "thinking" turned off (observed: Gemma emitting `<|thought| Thinking Process: …`
+# and taking ~45 s). Never let reasoning reach the voice or the memory stream.
+_THINK_BLOCK = re.compile(
+    r"<\|?\s*(?:think|thought|reasoning)\s*\|?>.*?<\|?\s*/\s*(?:think|thought|reasoning)\s*\|?>",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINK_OPEN = re.compile(
+    r"<\|?\s*(?:think|thought|reasoning)\b.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Gemma's "channel" thinking segments, e.g. `<|channel>thought\n…<channel|>`.
+_CHANNEL = re.compile(r"<\|channel>.*?(?:<channel\|>|$)", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Strip leaked chain-of-thought (closed ``<think>…</think>`` blocks, Gemma
+    ``<|channel>…`` segments, and any stray unclosed ``<|thought|…`` marker through
+    end-of-text) so the pet never speaks or stores its private reasoning. Benign
+    ``<`` in normal text is left alone (the marker must be immediately followed by
+    think/thought/reasoning/channel)."""
+    if not text or "<" not in text:
+        return text
+    text = _THINK_BLOCK.sub("", text)
+    text = _CHANNEL.sub("", text)
+    text = _THINK_OPEN.sub("", text)
+    return text.strip()
+
+
+# --- tolerate tool calls emitted as TEXT (weak-tool models) -------------------
+# Some small models (e.g. Gemma E4B) write `set_emotion("happy")` as plain content
+# instead of using the function-calling interface. Parse those back into real tool
+# calls so the robot ACTS instead of speaking the syntax aloud. Only lines that are
+# exactly a known tool name + (...) are touched — prose is never misparsed.
+def _tool_param_order() -> dict[str, list[str]]:
+    order = {}
+    for spec in AGENT_TOOL_SPECS:
+        fn = spec["function"]
+        order[fn["name"]] = list(fn.get("parameters", {}).get("properties", {}).keys())
+    return order
+
+
+_TOOL_PARAM_ORDER = _tool_param_order()
+_TOOL_NAMES = tuple(_TOOL_PARAM_ORDER)
+
+
+_TOOL_CALL_RE = re.compile(
+    r"\b(" + "|".join(map(re.escape, _TOOL_NAMES)) + r")\s*\((.*?)\)", re.DOTALL)
+
+
+def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
+    """Return [{name, arguments}] for tool calls a model wrote as text, or []. Finds
+    `name(...)` anywhere (handles markdown bullets, backticks, several per line); maps
+    positional args to each tool's parameter order; arg values via ast.literal_eval."""
+    calls: list[dict[str, Any]] = []
+    for m in _TOOL_CALL_RE.finditer(content):
+        name, argstr = m.group(1), m.group(2)
+        try:
+            node = ast.parse(f"{name}({argstr})", mode="eval").body
+        except SyntaxError:
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        params = _TOOL_PARAM_ORDER.get(name, [])
+        args: dict[str, Any] = {}
+        try:
+            for i, a in enumerate(node.args):
+                if i < len(params):
+                    args[params[i]] = ast.literal_eval(a)
+            for kw in node.keywords:
+                if kw.arg:
+                    args[kw.arg] = ast.literal_eval(kw.value)
+        except (ValueError, SyntaxError):
+            continue  # non-literal arg (likely real prose) — skip
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
+def _is_pure_tool_calls(content: str) -> bool:
+    """True if content is *only* tool calls (plus markdown punctuation) — no real prose."""
+    if not _TOOL_CALL_RE.search(content):
+        return False
+    leftover = re.sub(r"[\s`*\-,.:0-9]+", "", _TOOL_CALL_RE.sub("", content))
+    return leftover == ""
+
+
+def _strip_tool_calls(content: str) -> str:
+    """Remove tool-call substrings (and now-empty list punctuation), keeping real prose
+    — for cleaning stored thoughts / reflection insights."""
+    out = _TOOL_CALL_RE.sub("", content)
+    lines = []
+    for ln in out.splitlines():
+        ln = re.sub(r"^[\s`*\-,]+", "", re.sub(r"[\s`,]+$", "", ln))
+        if ln.strip():
+            lines.append(ln)
+    return "\n".join(lines).strip()
+
+# Tools the agent may use during a PRIVATE internal-monologue tick (cognition.py).
+# Deliberately excludes `speak` and `queue_question`: a private thought emotes and
+# glances but doesn't talk (speech is added back only on speak-eligible ticks) and
+# never defers a question to the human (that belongs to user-driven turns). Plan §12.
+SILENT_TOOL_NAMES = ("set_emotion", "look", "play_animation", "drive", "stop", "see")
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -161,12 +266,23 @@ class AgentBrain:
                          "set_idle_intensity", "set_emotion", "look", "queue_question")
             if hasattr(tools, name)
         }
+        # Restricted tool sets for the internal-monologue path (think()): silent
+        # (no speech) and speak-eligible (silent + speak). Built once from the full
+        # schema so the cognition loop can deterministically gate spontaneous speech.
+        self._silent_specs = [s for s in AGENT_TOOL_SPECS
+                              if s["function"]["name"] in SILENT_TOOL_NAMES]
+        self._speak_specs = self._silent_specs + [s for s in AGENT_TOOL_SPECS
+                                                  if s["function"]["name"] == "speak"]
+        # Optional hook set by the orchestrator when cognition is enabled: given the
+        # current utterance, returns a short retrieved-memory + mood block to append
+        # to the dynamic context. None → today's behavior (tests / cognition off).
+        self.memory_render = None
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     # --- prompt construction --------------------------------------------------
-    def _dynamic_context(self) -> str:
+    def _dynamic_context(self, extra: str | None = None) -> str:
         lines = ["## Current context",
                  "Recent answers the human has given you (use these; don't re-ask):",
                  self.state.render_recent_answers()]
@@ -174,12 +290,25 @@ class AgentBrain:
         if vision:
             lines += ["", f"What you last saw (recent): {vision}"]
         lines += ["", f"Body telemetry: {self.state.render_telemetry_line()}"]
+        if extra:
+            lines += ["", extra]
         return "\n".join(lines)
+
+    def _memory_block(self, query: str) -> str | None:
+        """Top-K retrieved memories + mood, via the orchestrator-set hook (or None).
+        Kept short — this block is re-encoded every turn (token budget). Never raises."""
+        if self.memory_render is None:
+            return None
+        try:
+            return self.memory_render(query) or None
+        except Exception:  # noqa: BLE001 - memory must never break a turn
+            log.debug("memory_render failed", exc_info=True)
+            return None
 
     def _build_messages(self, utterance: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.persona_text},
-            {"role": "system", "content": self._dynamic_context()},
+            {"role": "system", "content": self._dynamic_context(self._memory_block(utterance))},
         ]
         for role, text in list(self.state.conversation)[-self.ctx_turns:]:
             messages.append({"role": role, "content": text})
@@ -217,6 +346,110 @@ class AgentBrain:
             return await self._handle_streaming(messages)
         return await self._handle_buffered(messages)
 
+    # --- internal monologue (cognition.py) ------------------------------------
+    async def think(self, perception: str, memories, mood, allow_speak: bool) -> tuple[str, bool]:
+        """Run one PRIVATE cognitive turn. Returns ``(thought_text, spoke)``. Plan §12.
+
+        Unlike a spoken turn, this builds a *minimal* message list (persona + a
+        one-off framing message; no conversation history, for low per-tick cost),
+        uses a restricted tool set (silent unless ``allow_speak``), and **never
+        voices the returned content** — the content IS the private thought. Speech
+        happens only if the model explicitly calls ``speak`` (which the silent set
+        withholds), so chattiness is gated deterministically in code."""
+        messages = self._build_think_messages(perception, memories, mood, allow_speak)
+        # Silent ticks offer NO tools so the model returns a plain-words thought instead of
+        # emitting tool-call syntax (small models do that); the eyes are driven from mood by
+        # the cognition loop regardless. Speak-eligible ticks get the full silent+speak set.
+        specs = self._speak_specs if allow_speak else []
+        return await self._think_once(messages, specs, allow_speak)
+
+    def _build_think_messages(self, perception, memories, mood, allow_speak: bool):
+        mem_lines = "\n".join(f"- {m.content}" for m in memories) if memories \
+            else "(nothing in particular)"
+        action = (
+            "Write your thought in plain words. If — and only if — something is genuinely worth "
+            "saying out loud right now, you may also call the speak tool with one short line."
+            if allow_speak else
+            "Respond with ONLY your thought, in plain words — do not write any actions, function "
+            "calls, or quotes."
+        )
+        framing = (
+            "You are alone with your own thoughts for a moment — no one is asking you anything.\n"
+            "This is your private inner monologue. Whatever you write is a THOUGHT, not something "
+            "you say out loud.\n\n"
+            f"Right now:\n{perception}\n\n"
+            f"{mood.render()}\n\n"
+            f"On your mind (memories, most relevant first):\n{mem_lines}\n\n"
+            "Have one short private thought (one or two sentences) about what's going on or what "
+            f"you notice. {action}"
+        )
+        return [
+            {"role": "system", "content": self.persona_text},
+            {"role": "user", "content": framing},
+        ]
+
+    async def _think_once(self, messages: list[dict[str, Any]], specs: list,
+                          allow_speak: bool = False) -> tuple[str, bool]:
+        """Silent completion: dispatch tool calls (emote/look/…/maybe speak) but NEVER
+        voice the trailing content. Returns the latest non-empty content as the thought."""
+        thought = ""
+        spoke = False
+        for _ in range(MAX_TOOL_ITERS):
+            msg = await self._chat(messages, tools=specs)
+            content = (msg.get("content") or "").strip()
+            if content:
+                thought = content  # keep the latest private thought; never sent to TTS
+            tool_calls = msg.get("tool_calls") or []
+            messages.append(msg)
+            if not tool_calls:
+                break
+            for call in tool_calls:
+                if call.get("function", {}).get("name") == "speak":
+                    spoke = True  # voiced inside _run_tool via tools.speak()
+                result = await self._run_tool(call)
+                messages.append(
+                    {"role": "tool", "tool_call_id": call.get("id", ""), "content": result}
+                )
+            self._attach_pending_images(messages)
+        # The thought may itself be tool calls written as text — dispatch the actionable
+        # ones (emote/look) so the robot still reacts, and keep only prose as the thought.
+        if thought:
+            calls = _parse_text_tool_calls(thought)
+            if calls:
+                await self._dispatch_text_calls(calls, allow_speak=allow_speak)
+                if allow_speak and any(c["name"] == "speak" for c in calls):
+                    spoke = True
+                thought = _strip_tool_calls(thought)
+        return _strip_reasoning(thought), spoke
+
+    async def _dispatch_text_calls(self, calls: list[dict[str, Any]],
+                                   allow_speak: bool = True) -> bool:
+        """Execute tool calls a model emitted as text. speak() voices its text (only when
+        allowed); everything else goes through _run_tool. Returns True if anything ran."""
+        ran = False
+        for c in calls:
+            name, args = c["name"], c["arguments"]
+            if name == "speak":
+                text = _strip_reasoning(str(args.get("text", "")).strip())
+                if allow_speak and text:
+                    await self.tools.speak(text)
+                    ran = True
+            else:
+                await self._run_tool({"id": "", "type": "function",
+                                      "function": {"name": name, "arguments": json.dumps(args)}})
+                ran = True
+        return ran
+
+    async def complete_text(self, prompt: str, system: str | None = None) -> str:
+        """A plain, tool-free completion returning assistant text (for reflection /
+        meta-reasoning). Never voiced, never added to conversation. Plan §12."""
+        messages = [
+            {"role": "system", "content": system if system is not None else self.persona_text},
+            {"role": "user", "content": prompt},
+        ]
+        msg = await self._chat(messages, tools=[])  # empty → no tools offered
+        return _strip_tool_calls(_strip_reasoning((msg.get("content") or "").strip()))
+
     async def _handle_buffered(self, messages: list[dict[str, Any]]) -> str:
         final_text = ""
         for _ in range(MAX_TOOL_ITERS):
@@ -239,9 +472,17 @@ class AgentBrain:
             # No-op in split mode (the VLM already returned a text caption).
             self._attach_pending_images(messages)
 
-        # If the model spoke via plain content instead of the speak() tool, voice it.
+        # The model may end with plain content. If that content is actually tool calls
+        # written as text (weak-tool models), execute them; otherwise voice it (minus
+        # any leaked reasoning), staying silent if nothing's left.
         if final_text:
-            await self.tools.speak(final_text)
+            calls = _parse_text_tool_calls(final_text)
+            if calls and _is_pure_tool_calls(final_text):
+                await self._dispatch_text_calls(calls)
+            else:
+                spoken = _strip_reasoning(final_text)
+                if spoken:
+                    await self.tools.speak(spoken)
         return final_text
 
     # --- streaming turn (speak() text reaches TTS as it generates) ------------
@@ -279,9 +520,16 @@ class AgentBrain:
                     )
             self._attach_pending_images(messages)
 
-        # Fallback: model answered in plain content and never called speak().
+        # Fallback: model answered in plain content and never called speak(). If that
+        # content is tool calls written as text, execute them instead of voicing it.
         if final_text and not spoke_any:
-            await self.tools.speak(final_text)
+            calls = _parse_text_tool_calls(final_text)
+            if calls and _is_pure_tool_calls(final_text):
+                await self._dispatch_text_calls(calls)
+            else:
+                spoken = _strip_reasoning(final_text)
+                if spoken:
+                    await self.tools.speak(spoken)
         return final_text
 
     @staticmethod
@@ -291,17 +539,20 @@ class AgentBrain:
         except (json.JSONDecodeError, AttributeError):
             return ""
 
-    async def _chat_stream(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _chat_stream(self, messages: list[dict[str, Any]], tools=None) -> dict[str, Any]:
         """Stream a completion; feed any speak() text to TTS as it arrives.
-        Returns the fully assembled assistant message (content + tool_calls)."""
+        Returns the fully assembled assistant message (content + tool_calls).
+        ``tools`` defaults to the full schema; callers may pass a restricted set."""
+        specs = tools if tools is not None else AGENT_TOOL_SPECS
         payload = {
             "model": self.model,
             "messages": messages,
-            "tools": AGENT_TOOL_SPECS,
-            "tool_choice": "auto",
             "temperature": self.temperature,
             "stream": True,
         }
+        if specs:  # empty list → omit (tool_choice="auto" with no tools confuses some servers)
+            payload["tools"] = specs
+            payload["tool_choice"] = "auto"
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
         # Observatory tap (Plan §11): the brain's RECEIVING view. Redacted — only
@@ -309,8 +560,8 @@ class AgentBrain:
         if get_observatory().enabled:
             user = _last_user_text(messages)
             emit("lmstudio", "recv", "chat-request",
-                 f"{len(messages)} msgs, {len(AGENT_TOOL_SPECS)} tools: {user[:60]}",
-                 {"messages": len(messages), "tools": len(AGENT_TOOL_SPECS), "user": user})
+                 f"{len(messages)} msgs, {len(specs)} tools: {user[:60]}",
+                 {"messages": len(messages), "tools": len(specs), "user": user})
         content_parts: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         speakers: dict[int, _SpeakArgStreamer] = {}
@@ -407,23 +658,25 @@ class AgentBrain:
         emit("lmstudio", "exec", "tool-result", out[:80], {"result": out})
         return out
 
-    async def _chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _chat(self, messages: list[dict[str, Any]], tools=None) -> dict[str, Any]:
+        specs = tools if tools is not None else AGENT_TOOL_SPECS
         payload = {
             "model": self.model,
             "messages": messages,
-            "tools": AGENT_TOOL_SPECS,
-            "tool_choice": "auto",
             "temperature": self.temperature,
             "stream": False,
         }
+        if specs:  # empty list → omit (tool_choice="auto" with no tools confuses some servers)
+            payload["tools"] = specs
+            payload["tool_choice"] = "auto"
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
         # Observatory tap (Plan §11): brain's RECEIVING view (redacted). No-op when off.
         if get_observatory().enabled:
             user = _last_user_text(messages)
             emit("lmstudio", "recv", "chat-request",
-                 f"{len(messages)} msgs, {len(AGENT_TOOL_SPECS)} tools: {user[:60]}",
-                 {"messages": len(messages), "tools": len(AGENT_TOOL_SPECS), "user": user})
+                 f"{len(messages)} msgs, {len(specs)} tools: {user[:60]}",
+                 {"messages": len(messages), "tools": len(specs), "user": user})
         resp = await self._client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()

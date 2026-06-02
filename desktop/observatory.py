@@ -45,7 +45,7 @@ KIND VOCAB (drives the frontend's badge colors / filters; taps + demo + UI must 
 
   lmstudio recv:  chat-request
            send:  chat-response
-           exec:  tool:<name> | tool-result | tool-error | speak-feed
+           exec:  tool:<name> | tool-result | tool-error | speak-feed | thought | reflection | mood
 
   mcp      recv:  mcp:<name>
            send:  mcp-result | queued-frame

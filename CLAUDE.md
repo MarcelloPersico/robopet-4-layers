@@ -4,10 +4,13 @@ Guidance for Claude Code working in this repository.
 
 > **State (2026-06-01):**
 > - **`desktop/`** — fully implemented and verified on this machine; runs
->   end-to-end (text / voice / vision). 101 tests pass (`desktop/tests`) — incl.
->   the dual-OLED "eyes" face path (`test_face.py`) and the read-only four-layer
+>   end-to-end (text / voice / vision). 142 tests pass (`desktop/tests`) — incl.
+>   the dual-OLED "eyes" face path (`test_face.py`), the read-only four-layer
 >   **Observatory dashboard** (`test_observatory.py` / `test_dashboard.py`;
->   browser-verified + a live LM Studio smoke test 2026-06-02).
+>   browser-verified + a live LM Studio smoke test 2026-06-02), and the **"alive"
+>   cognition subsystem** (`test_memory.py` / `test_mood.py` / `test_cognition.py`
+>   + `test_llama_server.py`; internal monologue + learning memory + mood, on by
+>   default — see `desktop/COGNITION.md`. Live smoke test still TODO by the owner).
 > - **`pi/`** — implemented (`bridge.py`, `capture.py`, `wsclient.py`,
 >   `protocol.py`, `setup.sh`; 6 tests). **Bench-verified on hardware 2026-06-01**:
 >   provisioned a Pi Zero 2 W (Raspberry Pi OS Lite / Debian 13 trixie / py3.13),
@@ -135,6 +138,10 @@ Teensy's USB serial stays exposed for bench bringup.
 | `dashboard.py` | Read-only four-layer "Observatory" web dashboard (one `websockets` listener = HTTP + WS) + standalone `--demo` simulator | §11 |
 | `dashboard.html` | Single-file UI: live dual-OLED **eyes** (faithful firmware port) + per-layer RECV/SEND/EXEC panes + camera thumbnails | §11 |
 | `persona.md` | Static, prefix-cacheable system-prompt portion | §5.4 |
+| `cognition.py` | Background "alive" tick: internal monologue (private thoughts) + reflection + mood; subsumes the idle loop when on. **On by default** (`[cognition].enable`) | §12 |
+| `memory.py` | Persistent memory stream (`data/memory.sqlite`): dialogue/resolution/thought/reflection rows; numpy recency×importance×relevance recall. NOT raw vision | §12 |
+| `mood.py` | Persistent PAD mood: decays toward a circadian baseline, colors generation, maps to an OLED expression; persisted in the memory DB `kv` | §12 |
+| `embeddings.py` | Lazy local sentence embedder (`bge-small-en-v1.5`) for memory relevance; heavy import deferred so `.venv` tests use a fake | §12 |
 
 ### Agent loop (§5)
 Local LLM via an OpenAI-compatible server (managed `llama-server.exe` or external
@@ -142,7 +149,16 @@ LM Studio), function-calling. Tools: `drive`, `play_animation`, `stop`, `see`,
 `speak`, `set_idle_intensity`, **`set_emotion`** + **`look`** (the dual-OLED eyes
 — 15 core emotions + gaze), and **`queue_question`** (the deferral path).
 System prompt = static `persona.md` + dynamic context (recent-answers buffer,
-last ~6 turns, recent `see()`, telemetry one-liner, new utterance).
+last ~6 turns, recent `see()`, telemetry one-liner, new utterance, **+ top-K
+retrieved memories + the current mood line when cognition is on**).
+
+**Internal monologue (§12, on by default):** `cognition.py` runs a background tick
+(only when `_busy` is free) that calls `agent.think()` — a *private* completion
+that never voices its content and uses a silent tool set (no `speak`) on most
+ticks, so the robot thinks/emotes continuously but speaks spontaneously only
+rarely (cooldown + probability gated). Thoughts/reflections persist to
+`memory.py` and stream to the dashboard as `thought`/`mood`/`reflection` events.
+See `desktop/COGNITION.md` (incl. the deferred model-swap → managed llama.cpp).
 
 **Deferral criteria (§5.2)** — call `queue_question` only when at least one holds:
 low object-identity confidence, reasoning beyond ~3 steps, opinion/judgment
@@ -254,11 +270,12 @@ GPU/hardware stack (heavy libs are lazy-imported):
 python -m venv .venv
 .\.venv\Scripts\pip install ruff pytest pytest-asyncio websockets httpx "mcp>=1.0" numpy
 .\.venv\Scripts\ruff check desktop pi          # clean
-.\.venv\Scripts\python -m pytest desktop       # 101 tests (protocol, queue, state, config,
+.\.venv\Scripts\python -m pytest desktop       # 142 tests (protocol, queue, state, config,
                                                #   tts, tools, agent loop, asr, half-duplex,
                                                #   ws loopback, MCP defer-to-human end-to-end,
                                                #   face/eyes emote+look path, observatory bus,
-                                               #   dashboard HTTP+WS + demo feeder)
+                                               #   dashboard HTTP+WS + demo feeder, cognition
+                                               #   memory/mood/tick + think() + build_args)
 .\.venv\Scripts\python -m pytest pi            # 6 tests (protocol, VAD audio-gate)
 ```
 The Teensy firmware needs PlatformIO; the full orchestrator needs the models + a
