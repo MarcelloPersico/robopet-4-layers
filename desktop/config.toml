@@ -53,6 +53,12 @@ temperature = 0.7
 # Stream the reply so spoken sentences start playing before the LLM finishes a
 # long answer (Plan §5.6). Set false to wait for the full reply, then speak.
 stream = true
+# Reasoning hint sent on every chat completion (OpenAI-compatible). "none" tells a
+# reasoning-capable server (LM Studio, recent llama.cpp) to skip the chain-of-thought
+# and answer directly. The pet wants terse tool calls and the streaming loop discards
+# any reasoning_content, so thinking is pure latency here (≈3× slower turns). Set to
+# "low"/"medium"/"high" only for a model that benefits; "" omits the field entirely.
+reasoning_effort = "none"
 
 [tts]
 # backend = "piper"  -> fast CPU subprocess voice (neutral). Default.

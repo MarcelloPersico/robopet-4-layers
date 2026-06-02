@@ -129,6 +129,7 @@ class AgentBrain:
         temperature: float = 0.7,
         ctx_turns: int = 6,
         stream: bool = True,
+        reasoning_effort: str = "none",
     ):
         self.base_url = base_url.rstrip("/")
         self.tools = tools
@@ -137,6 +138,14 @@ class AgentBrain:
         self.model = model
         self.temperature = temperature
         self.ctx_turns = ctx_turns
+        # OpenAI-compatible reasoning hint sent on every completion. "none" tells a
+        # reasoning-capable server (LM Studio, recent llama.cpp) NOT to emit a
+        # chain-of-thought before answering. The pet wants terse tool calls, not a
+        # thinking trace — and the streaming loop discards reasoning_content anyway,
+        # so leaving thinking on is pure latency (≈3× slower turns; see Plan §5.6).
+        # Set to "low"/"medium"/"high" only for a model that benefits from it; ""
+        # omits the field entirely for servers that reject it.
+        self.reasoning_effort = reasoning_effort
         # Stream the LLM reply and feed speak() text to TTS sentence-by-sentence
         # so audio starts before a long answer finishes (Plan §5.6). Requires a
         # streamable TTS; falls back to the buffered path otherwise.
@@ -293,6 +302,8 @@ class AgentBrain:
             "temperature": self.temperature,
             "stream": True,
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         # Observatory tap (Plan §11): the brain's RECEIVING view. Redacted — only
         # message/tool counts + the last user text (no image bytes). No-op when off.
         if get_observatory().enabled:
@@ -405,6 +416,8 @@ class AgentBrain:
             "temperature": self.temperature,
             "stream": False,
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         # Observatory tap (Plan §11): brain's RECEIVING view (redacted). No-op when off.
         if get_observatory().enabled:
             user = _last_user_text(messages)

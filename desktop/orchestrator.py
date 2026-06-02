@@ -68,6 +68,7 @@ class Orchestrator:
             model=a.get("model", "local"),
             temperature=a.get("temperature", 0.7),
             stream=a.get("stream", True),
+            reasoning_effort=a.get("reasoning_effort", "none"),
         )
         self._llama_proc: asyncio.subprocess.Process | None = None
         self._busy = asyncio.Lock()  # serialize agent turns / guard idle vs speech
