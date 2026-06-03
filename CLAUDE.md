@@ -202,9 +202,10 @@ HTTP/SSE binding.
 - **`[mcp]`** — `enable_http`/`http_host`/`http_port`/`http_bearer_token` for the
   live in-process HTTP/SSE binding (localhost-only by default).
 
-**This machine's live config:** LM Studio serving **Gemma-4-26B-A4B** (multimodal
-MoE) on `:1234` (`manage_server=false`), `mode="unified"`, `stream=true`,
-`backend="kokoro"` (CPU). Tool-calling + vision verified through LM Studio.
+**This machine's live config:** LM Studio serving **Qwen3.5-9B** (instruct, NVFP4 —
+natively multimodal) on `:1234` (`manage_server=false`), `mode="unified"`,
+`stream=true`, `backend="kokoro"` (CPU). Native tool-calling + vision verified
+through LM Studio. (Was Gemma-4-26B-A4B; switched to Qwen3.5-9B 2026-06.)
 
 ## Components (pi/, teensy/)
 
@@ -244,7 +245,7 @@ External binaries/models (paths in `config.toml`; override in `config.local.toml
   + `C:/models/qwen2.5-7b-instruct-q4_k_m.gguf`
 - `C:/tools/piper/piper.exe` + `C:/models/piper/en_US-amy-medium.onnx`
 - ASR `large-v3-turbo`, VLM `vikhyatk/moondream2` (auto-downloaded)
-- Kokoro-82M (`pip install kokoro`, auto-downloads); LM Studio runs Gemma on `:1234`
+- Kokoro-82M (`pip install kokoro`, auto-downloads); LM Studio runs Qwen3.5-9B on `:1234`
 
 GPU notes: Whisper runs on GPU (~0.14 s/utterance) via ctranslate2's CUDA-12 build
 (`nvidia-cublas-cu12` + `nvidia-cudnn-cu12`; `asr.py` registers their DLL dirs).

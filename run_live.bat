@@ -8,7 +8,7 @@ REM  The dashboard is exposed on your LAN as  http://elena.local:8772
 REM  (configured in desktop\config.local.toml -> [dashboard] enable/host/mdns_name).
 REM
 REM  Prereqs:
-REM    * LM Studio running with the Gemma model loaded (port 1234)
+REM    * LM Studio running with the Qwen3.5-9B model loaded (port 1234)
 REM    * Pi + Teensy powered on and connected (they stream over the WS link)
 REM    * Firewall rule for TCP 8772 (already added) so phones/laptops can reach it
 REM ===========================================================================

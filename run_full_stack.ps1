@@ -7,10 +7,10 @@
 # command:  you SPEAK to it, it replies on the speaker + sees via the webcam, and
 # Claude (Claude Desktop "robot-desk-pet-live", or the inspector) is connected live.
 #
-#   - local LLM brain : your running LM Studio (Gemma) on :1234 — start it yourself
+#   - local LLM brain : your running LM Studio (Qwen3.5-9B) on :1234 — start it yourself
 #   - voice in        : desktop microphone (Whisper, GPU)
 #   - voice out       : desktop speaker (Kokoro TTS)
-#   - vision          : desktop webcam -> see()  (Gemma sees frames, unified mode)
+#   - vision          : desktop webcam -> see()  (Qwen3.5-9B sees frames, unified mode)
 #   - live MCP server : http://127.0.0.1:8770/mcp  (Claude drives this pet)
 #
 # This needs the FULL model stack (torch+CUDA, faster-whisper, kokoro), which lives
@@ -94,7 +94,7 @@ try {
     $null = Invoke-WebRequest -Uri "http://127.0.0.1:1234/v1/models" -TimeoutSec 2 -UseBasicParsing
     Write-Host "LM Studio    : reachable on :1234" -ForegroundColor Green
 } catch {
-    Write-Host "LM Studio    : NOT reachable on :1234 - start it and load Gemma," -ForegroundColor Yellow
+    Write-Host "LM Studio    : NOT reachable on :1234 - start it and load Qwen3.5-9B," -ForegroundColor Yellow
     Write-Host "               or the pet will error on the first thing you say." -ForegroundColor Yellow
 }
 

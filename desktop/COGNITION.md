@@ -73,9 +73,9 @@ dashboard code changes. All no-ops when the dashboard is off.
 
 The cognition loop calls the LLM *frequently* (a tick plus per-turn memory
 injection), so a smaller/faster model with a bigger context helps. Today this
-machine runs **LM Studio + Gemma-26B (unified vision)**; cognition works on it,
-but a tick on a 26B model is heavy — keep `tick_interval_s` generous and watch the
-logs.
+machine runs **LM Studio + Qwen3.5-9B (unified vision)**; cognition works well on
+it — a 9B tick is much lighter than the former Gemma-26B, so `tick_interval_s` can
+be tighter; still watch the logs.
 
 **Recommended future step — move off LM Studio to managed llama.cpp + a small
 model (e.g. Qwen3-8B):**
